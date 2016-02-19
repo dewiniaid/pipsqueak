@@ -3,14 +3,90 @@ props.py - Object change tracking and history control.
 Copyright 2016, Daniel "dewiniaid" Grace - https://github.com/dewiniaid
 
 Licensed under the Eiffel Forum License 2.
-"""
 
+
+The various support classes and functions in this file provide a mechanism for tracking pending changes to an object,
+applying said pending changes, and merging data back in from an authoritative source.
+
+To use this mechanism, subclass "TrackedBase" and add various *Properties to the subclass, e.g.:
+
+    class MyClass(TrackedBase):
+        foo = TrackedProperty()
+        bar = TrackedProperty(default=42)
+        baz = DictProperty()
+
+The default constructor for the subclass performs some initialization, and then initialized properties based on its
+kwargs and the defined defaults for those properties.  You *must* call the default constructor if subclassing, or else
+most of the magic will break.
+
+Properties that do not specify a default default to None.  Properties that specify a callable for their default will
+have the callable called to determine their default value.
+
+Internal flow works as follows:
+
+1. The base class maintains a `_props` dict consisting of `property_name: property_object` for all properties.  This
+   dict is initialized by the metaclass.
+
+   Thus, you can iterate over all properties with `for name, prop in self._props.items()`
+
+2. The default constructor initializes self._changed to an empty set and self._data to an empty dict.
+   self._changed contains all changed properties.
+   self._data is the internal storage for raw property values -- self._data[prop] roughly corresponds to self.prop
+
+   All properties are initialized to their defaults.  If any kwargs are present, those properties are initialized
+   accordingly and are considered changed.
+
+Setting a property adds it to instance._changed as well as updating instance._data.
+
+Getting a property retrieves the current value from instance._data
+
+The other attributes of a Property object perform more substantial tasks related mostly to persistence:
+
+* setup: Called once per property by the Metaclass.  Used to perform some late initialization.
+* write: Given a dict, writes an output-suitable format of the property back to the data structure.  For instance,
+  calling Property.write(...) using the same dictionary for every property will yield a dictionary suitable for JSON
+  serialization
+* dump: Helper function used by most write implementations to retrieve the appropriate value.  (Write ensures the
+  correct key(s) of the dict are written to, dump retrieves the value that is actually written)
+* read: Given a dict, sets the property based on the appropriate value(s) in the dict.  This is the opposite of write()
+* load: Opposite of dump(), used by read implementations
+* has: Given a dict of JSON data, returns whether it contains this property or not.
+* commit: Used to signal that this property change has been successfully committed to the authoritative source.
+  Removes the property from the list of changed properties.
+
+This is the basic implementation intended for use by all immutable properties -- text, integers, etc.
+
+Collections work a bit differently: In addition to the property-level change tracking, collections maintain their own
+list of pending changes.  These changes can be re-applied on top of a replacement collection to allow for circumstances
+such as:
+    * You locally add an item to a set
+    * The remote end adds an item to the set
+    * You refresh the set from the remote end
+    * Your addition is then re-added to the set, even though it's not yet present in the remote end's data.
+
+Not all changes can be properly tracked and reapplied.  If an untrackable change is detected, the collection will flag
+the entire collection to replace whatever the remote data is rather than cleanly merging with it.
+
+Trackable changes include:
+    * Adding, removing, or modifying a key in a dictionary
+    * Adding or removing an item from a set
+    * Appending an item to the end of a list.
+
+Untrackable changes triggering full-replacement include:
+    * Modfying an element of a list, including removing it.
+    * Replacing a dict, list or set with a completely new dict, list or set
+
+To manage all of this, InstrumentedProperties add the following changes to logic
+
+* merge: Replays trackable changes against the updated data if no untrackable changes exist.
+* read: uses merge to update the existing data structure rather than complete replacement.
+"""
 import datetime
 import iso8601
 import itertools
 import functools
 import collections
-
+import warnings
 
 __all__ = [
     'TrackedProperty', 'TrackedMetaclass', 'TrackedBase', 'TypeCoercedProperty', 'DateTimeProperty',
@@ -18,6 +94,8 @@ __all__ = [
     'SetProperty', 'ListProperty', 'DictProperty', 'EventEmitter', 'InstrumentedProperty'
 ]
 
+
+# noinspection PyProtectedMember
 class TrackedProperty:
     """
     Tracks attribute changes on an object.
@@ -46,6 +124,8 @@ class TrackedProperty:
     def get(self, instance):
         """
         Retrieves property value.
+
+        :param instance: Instance to retrieve value from.
         """
         return instance._data[self.name]
 
@@ -65,11 +145,13 @@ class TrackedProperty:
             instance._changed.add(self)
 
     def __set__(self, instance, value):
-        self.set(instance, value, dirty=True)
+        self.set(instance, value)
 
     def dump(self, instance):
         """
         Returns the JSON representation of this property, when possible.
+
+        :param instance: Instance to set value on.
 
         Whether this is actually used by write() is implementation-dependant.
         """
@@ -78,6 +160,9 @@ class TrackedProperty:
     def write(self, instance, json):
         """
         Update json with results of exporting data
+
+        :param instance: Instance to retrieve value from.
+        :param json: JSON to write to.
         """
         if self.readonly:
             return
@@ -87,6 +172,8 @@ class TrackedProperty:
         """
         Takes a property from JSON and converts it to our native format, when possible.
 
+        :param value: Value to interpret.
+
         Whether this is actually used by read() is implementation-dependant.
         """
         return value
@@ -94,15 +181,34 @@ class TrackedProperty:
     def read(self, instance, json):
         """
         Read json data and update the instance.
+
+        :param instance: Instance to update.
+        :param json: Incoming JSON data.
         """
-        instance._data[self.name] = self.load(json.get(self.remote_name))
+        try:
+            value = json[self.remote_name]
+        except KeyError:
+            # Value not in response data, do nothing
+            return
+        instance._data[self.name] = self.load(value)
         instance._changed.discard(self)
 
     def has(self, instance, json):
         """
         Returns True if this property is in the json data.
+
+        :param instance: Unused.
+        :param json: JSON data to examine.
         """
         return self.remote_name in json
+
+    def commit(self, instance):
+        """
+        Signals to our container that we've been 'committed' to the remote end and thus are no longer modified.
+
+        :param instance: Instance we're stored on.
+        """
+        instance._changed.discard(self)
 
 
 class DateTimeProperty(TrackedProperty):
@@ -119,7 +225,7 @@ class DateTimeProperty(TrackedProperty):
                 # Current timestamps are 10 digits long.  It will be at least 200 years before this changes...
                 # so I think this is reasonably future-proof given it's a patch against an API bug.
                 if len(str(value)) > 10:
-                    value = value / 1000
+                    value /= 1000
             return datetime.datetime.fromtimestamp(value, tz=self.UTC)
         raise ValueError("Invalid datetime format")
 
@@ -152,11 +258,12 @@ class TypeCoercedProperty(TrackedProperty):
         return self.coerce_dump(result)
 
 
+# noinspection PyInitNewSignature
 class TrackedMetaclass(type):
     """
     When an object is created with this metaclass, any TrackedProperties are automatically configured.
     """
-    def __new__(cls, name, bases, namespace, **kwds):
+    def __new__(mcs, name, bases, namespace, **kwds):
         if '_props' not in namespace:
             namespace['_props'] = set()
         for name, value in namespace.items():
@@ -165,7 +272,7 @@ class TrackedMetaclass(type):
                     value.name = name
                 value.setup()
                 namespace['_props'].add(value)
-        return type.__new__(cls, name, bases, namespace, **kwds)
+        return type.__new__(mcs, name, bases, namespace, **kwds)
 
 
 class TrackedBase(metaclass=TrackedMetaclass):
@@ -174,17 +281,30 @@ class TrackedBase(metaclass=TrackedMetaclass):
     """
     def __init__(self, **kwargs):
         self._data = {}
-        for prop in self._props:
-            value = kwargs[prop.name] if prop.name in kwargs else prop.default
-            if callable(value):
-                value = value()
-            prop.set(self, value, dirty=False)
         self._changed = set()
+        # noinspection PyUnresolvedReferences
+        for prop in self._props:
+            dirty = prop.name in kwargs
+            if dirty:
+                value = kwargs[prop.name]
+            else:
+                value = prop.default
+                if callable(value):
+                    value = value()
+            prop.set(self, value, dirty)
 
     def commit(self):
         for prop in self._changed:
-            if isinstance(prop, InstrumentedProperty):
-                prop.commit(self)
+            prop.commit(self)
+        if self._changed:
+            warnings.warn(
+                "Instance of {class_!r} still contained {ct} pending change(s) after commit: {properties}"
+                .format(
+                    class_=self.__class__.__name__,
+                    ct=len(self._changed),
+                    properties=", ".join(prop.name for prop in self._changed)
+                )
+            )
         self._changed = set()
 
 
@@ -225,7 +345,9 @@ class EventEmitter:
     CHANGED = object()
     COMMITTED = object()
     MERGED = object()
+
     def __init__(self, *args, **kwargs):
+        # noinspection PyArgumentList
         super().__init__(*args, **kwargs)
         self._listeners = collections.defaultdict(set)
 
@@ -290,8 +412,9 @@ class InstrumentedList(EventEmitter, list):
             logged, items = itertools.tee(items, 2)
             self.appends.extend(logged)
         return super().extend(items)
-for attr in "insert remove pop clear index sort reverse __delitem__ __setitem__ __iadd__ __imul__".split(" "):
-    make_wrapper(InstrumentedList, attr, InstrumentedList._notify)
+for _attr in "insert remove pop clear sort reverse __delitem__ __setitem__ __iadd__ __imul__".split(" "):
+    # noinspection PyProtectedMember
+    make_wrapper(InstrumentedList, _attr, InstrumentedList._notify)
 
 
 class InstrumentedSet(EventEmitter, set):
@@ -364,12 +487,14 @@ class InstrumentedSet(EventEmitter, set):
             self.changes[item] = False
         return result
 
-for attr in "__iand__ __ixor__ clear difference_update intersection_update symmetric_difference_update pop".split(" "):
-    make_wrapper(InstrumentedSet, attr, InstrumentedSet._notify)
+for _attr in "__iand__ __ixor__ clear difference_update intersection_update symmetric_difference_update pop".split(" "):
+    # noinspection PyProtectedMember
+    make_wrapper(InstrumentedSet, _attr, InstrumentedSet._notify)
 
 
 class InstrumentedDict(EventEmitter, dict):
     _DELETED = object()
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.changes = {}
@@ -402,13 +527,6 @@ class InstrumentedDict(EventEmitter, dict):
         self.replace = True
 
     @EventEmitter.emits(EventEmitter.CHANGED)
-    def add(self, item):
-        result = super().add(self, item)
-        if not self.replace:
-            self.changes[item] = True
-        return result
-
-    @EventEmitter.emits(EventEmitter.CHANGED)
     def update(self, *e, **f):
         if self.replace:
             return super().update(*e, **f)
@@ -429,10 +547,12 @@ class InstrumentedDict(EventEmitter, dict):
         super().__setitem__(key, value)
         if not self.replace:
             self.changes[key] = value
-for attr in "clear fromkeys pop popitem setdefault".split(" "):
-    make_wrapper(InstrumentedDict, attr, InstrumentedDict._notify)
+for _attr in "clear fromkeys pop popitem setdefault".split(" "):
+    # noinspection PyProtectedMember
+    make_wrapper(InstrumentedDict, _attr, InstrumentedDict._notify)
 
 
+# noinspection PyProtectedMember,PyProtectedMember
 class InstrumentedProperty(TypeCoercedProperty):
     def set(self, instance, value, dirty=True):
         def listener(obj):
@@ -446,24 +566,41 @@ class InstrumentedProperty(TypeCoercedProperty):
             value.add_listener(EventEmitter.CHANGED, listener)
 
     def merge(self, instance, incoming, dirty=False):
+        """
+        Merge incoming data ('new') with our current values ('old')
+
+        :param instance: Instance we're modifying
+        :param incoming: Incoming property value
+        :param dirty: Determines whether the property is still considered 'changed' if the new data completely
+            overwrites the old.
+
+        If 'old' or 'new' are None, 'new' overwrites 'old' entirely without any changes.
+        Otherwise, merges new into old.
+        """
         value = self.get(instance)
-        if value:
-            value.merge(incoming)
+        if value is None or incoming is None:
+            self.set(instance, incoming, dirty)
+            if not dirty:
+                instance._changed.discard(self)
             return
-        self.set(instance, incoming, dirty)
-        if not dirty:
-            instance._changed.discard(self)
+        value.merge(incoming)
         return
 
     def read(self, instance, json, merge=False):
         if not merge:
             return super().read(instance, json)
-        value = self.load(json[self.remote_name])
+        try:
+            value = json[self.remote_name]
+        except KeyError:
+            return
+        value = self.load(value)
         return self.merge(instance, value)
 
     def commit(self, instance):
         value = self.get(instance)
-        value.commit()
+        if value is not None:
+            value.commit()
+        super().commit(instance)
 
 
 SetProperty = functools.partial(InstrumentedProperty, coerce=InstrumentedSet, coerce_dump=list)
