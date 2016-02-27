@@ -1,8 +1,7 @@
 import pydle
 import configparser
 import re
-
-
+import commands
 
 
 class Configuration:
@@ -79,7 +78,8 @@ class Ratbot(pydle.Client, pydle.BasicClient, pydle.features.TLSSupport):
         kwargs.setdefault('fallback_nickname', config.nicknames[1:])
         for attr in (
             'tls_client_cert', 'tls_client_cert_key', 'tls_client_cert_password',
-            'username', 'realname'
+            'username', 'realname',
+            'prefix'
         ):
             kwargs.setdefault(attr, getattr(config, attr))
         super.__init__(**kwargs)
@@ -101,3 +101,5 @@ class Ratbot(pydle.Client, pydle.BasicClient, pydle.features.TLSSupport):
             except pydle.AlreadyInChannel:
                 pass
 
+    def command(self, fn=None, name=None, aliases=None, patterns=None, bindings=None, help=None):
+        return

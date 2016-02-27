@@ -48,6 +48,13 @@ import collections
 import functools
 import itertools
 
+__all__ = [
+    'Argument', 'ArgumentList',
+    'CommandBinding', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
+    'UsageError', 'FinalUsageError',
+    'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'match', 'help'
+]
+
 
 class Argument(str):
     """
@@ -1110,6 +1117,8 @@ def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, help
     c.bindings = (bindings or []) + list(reversed(fn.bindings))
     c.help = "\n".join(([help] if help else []) + list(reversed(fn.help)))
     c.finish(altname = fn.function.__name__)
+    if registry:
+        registry.register(c)
     return fn.function
 
 
