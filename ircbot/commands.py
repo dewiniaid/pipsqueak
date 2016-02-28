@@ -50,9 +50,9 @@ import itertools
 
 __all__ = [
     'Argument', 'ArgumentList',
-    'CommandBinding', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
-    'UsageError', 'FinalUsageError',
-    'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'match', 'help'
+    'Binding', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
+    'UsageError', 'FinalUsageError', 'ParseError', 'ParseResult'
+    'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'match', 'doc'
 ]
 
 
@@ -73,7 +73,7 @@ class Argument(str):
         self._text = text
         self._start = span[0]
         self._eol = None
-        super.__init__(s)
+        super().__init__(s)
 
     @property
     def eol(self):
@@ -89,6 +89,7 @@ class Argument(str):
         return self._eol
 
 
+# noinspection PyShadowingNames
 class ArgumentList(list):
     """
     When parsing IRC commands, it's often useful to have the input text split into words -- usually by
@@ -107,7 +108,7 @@ class ArgumentList(list):
         :param text: Original text.
         """
         self.text = text
-        super().__init(
+        super().__init__(
             Argument(match.group(), self.text, match.start())
             for match in self.pattern.finditer(self.text)
         )
@@ -216,7 +217,8 @@ class FinalUsageError(UsageError):
     pass
 
 
-class CommandBinding:
+# noinspection PyShadowingNames
+class Binding:
     """
     A given IRC command can have one or more bindings.
     A binding consists of:
@@ -404,9 +406,7 @@ class CommandBinding:
         def adapt_parse_error(ex):
             if ex.message is not None or ex.pos is not None:
                 raise ex
-            else:
-                raise parse_error_here(ex.message)
-            raise ex
+            raise parse_error_here(ex.message)
 
         params = []          # List of parameter structures
         self.params = params
@@ -562,6 +562,7 @@ class Parameter:
     LIST_NONE = 0
     LIST_NORMAL = 1
     LIST_VARARGS = 2
+
     def __init__(self, parent, index, arg, type_=None, options=None, name=None, listmode=LIST_NONE, required=True):
         """
         Defines a new parameter
@@ -620,11 +621,11 @@ class Parameter:
             return
         if not self.parser.check:
             return
-        for arg in self.args(arglist):
+        for index, arg in enumerate(self.args(arglist), self.index):
             try:
                 self.parser.validate(arg.eol if self.parser.eol else arg)
-            except UsageError:
-                raise
+            except UsageError as ex:
+                raise UsageError(ex.message, arglist, index)
             except Exception as ex:
                 if self.parser.wrap_exceptions:
                     raise UsageError("Invalid format for {name}") from ex
@@ -635,13 +636,15 @@ class Parameter:
         Updates the args and kwargs that we'll use to call the bound function based on what the ParamType handler says
 
         :param arglist: A :class:`ArgumentList`
+        :param args: Initial arguments to pass to function
+        :param kwargs: Additional keyword arguments to pass to function
         """
         values = []
-        for arg in self.args(arglist):
+        for index, arg in enumerate(self.args(arglist), self.index):
             try:
                 values.append(self.parser.parse(arg.eol if self.parser.eol else arg))
-            except UsageError:
-                raise
+            except UsageError as ex:
+                raise UsageError(ex.message, arglist, index)
             except Exception as ex:
                 if self.parser.wrap_exceptions:
                     raise UsageError("Invalid format for {name}") from ex
@@ -712,8 +715,8 @@ class ParamType:
         return
 
 
-@CommandBinding.register_type('str')
-@CommandBinding.register_type('line', eol=True)
+@Binding.register_type('str')
+@Binding.register_type('line', eol=True)
 class StrParamType(ParamType):
     def __init__(self, param, eol=False):
         """
@@ -732,7 +735,7 @@ class StrParamType(ParamType):
             self.parse = str
 
 
-@CommandBinding.register_type('const')
+@Binding.register_type('const')
 class ConstParamType(ParamType):
     check = True
 
@@ -759,8 +762,8 @@ class ConstParamType(ParamType):
             raise UsageError(fmt.format(name=self.param.name, values=", ".join(self.values)))
 
 
-@CommandBinding.register_type('int', coerce=int, coerce_error="{name} must be an integer")
-@CommandBinding.register_type('float', coerce=float, coerce_error="{name} must be a number")
+@Binding.register_type('int', coerce=int, coerce_error="{name} must be an integer")
+@Binding.register_type('float', coerce=float, coerce_error="{name} must be a number")
 class NumberParamType(ParamType):
     def __init__(self, param, coerce=int, coerce_error=None):
         """
@@ -768,11 +771,13 @@ class NumberParamType(ParamType):
 
         :param param: Parameter are bound to.
         :param coerce: Function that coerces 'min', 'max' and the input to integers.
+        :param coerce_error: Error message for coercion failures.
 
         param.options may contain a string in the form of 'min..max' or 'min' that determines the lower and upper
         bounds for this argument.  if either 'min' or 'max' are blank (as opposed to 0), the range is treated as
         unbound at that end.
         """
+        super().__init__(param)
         self.coerce = coerce
         self.coerce_error = coerce_error
 
@@ -815,7 +820,8 @@ class NumberParamType(ParamType):
             )
 
 
-class CommandRegistry:
+# noinspection PyShadowingNames
+class Registry:
     """
     Registers commands and serves as the intermediary between command and interface.
 
@@ -889,11 +895,11 @@ class CommandRegistry:
 
         # chain is to ensure there's always at least two elements by adding a dummy one.
         search, text, *_ = itertools.chain(self.separator.split(text[match.end(0):], 1), ['']*2)
-
         return ParseResult(prefix, self.lookup(search), text)
-DEFAULT_REGISTRY = CommandRegistry()
+DEFAULT_REGISTRY = Registry(prefix='!')
 
 
+# noinspection PyShadowingNames
 class ParseResult:
     """Stores the result from :meth:`CommandRegistry.parse`"""
     def __init__(self, prefix=None, command=None, text=None):
@@ -943,6 +949,7 @@ class ParseResult:
 ParseResult.NULL_RESULT = ParseResult()
 
 
+# noinspection PyShadowingNames
 class Command:
     """
     Represents commands.
@@ -965,7 +972,7 @@ class Command:
     patterns = []    # Patterns.  (Regular expressions or strings that will be compiled into one)
     bindings = []    # Associated command bindings, in order of priority.
 
-    def __init__(self, name=None, aliases=None, patterns=None, bindings=None, help=None, usage=None):
+    def __init__(self, name=None, aliases=None, patterns=None, bindings=None, doc=None, usage=None):
         """
         Defines a new command.
 
@@ -973,14 +980,14 @@ class Command:
         :param aliases: Command aliases.
         :param patterns: Regular expression patterns.
         :param bindings: Command bindings.
-        :param help: Detailed help text.
+        :param doc: Detailed help text.
         :param usage: Usage error text displayed when all bindings fail.
         """
         self.name = name
         self.aliases = aliases or []
         self.patterns = patterns or []
         self.bindings = bindings or []
-        self.help = help
+        self.doc = doc
         self._done = False
         self.pending_functions = []  # From things being added by decorators.
         self.usage = usage
@@ -1057,11 +1064,13 @@ def wrap_decorator(fn):
     If the first argument of the wrapped function is a callable, the wrapped function is called as-is.
 
     Otherwise, returns a decorator
+
+    :param fn: Function to decorate.
     """
     # Determine the name of the first argument, in case it is specified in kwargs instead.
     signature = inspect.signature(fn)
     arg = None
-    param = next(iter(signature.parameters.items()), None)
+    param = next(iter(signature.parameters.values()), None)
     if param and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
         arg = param.name
 
@@ -1069,6 +1078,7 @@ def wrap_decorator(fn):
     def wrapper(*args, **kwargs):
         if (args and callable(args[0])) or (arg in kwargs and callable(kwargs[arg])):
             return fn(*args, **kwargs)
+
         def decorator(_fn):
             return fn(_fn, *args, **kwargs)
         return decorator
@@ -1078,9 +1088,11 @@ def wrap_decorator(fn):
 def chain_decorator(fn):
     """
     The wrapped function will always receive a PendingCommand instead of a function, and will always return that same
-    PendingCommand.  This allows for wrapping.
+    PendingCommand.  This allows for chaining decorators.
 
     If fn is not a PendingCommand, converts it to one.
+
+    :param fn: Function to decorate.
     """
     @wrap_decorator
     @functools.wraps(fn)
@@ -1091,8 +1103,9 @@ def chain_decorator(fn):
         return pending
 
 
+# noinspection PyShadowingNames
 @wrap_decorator
-def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, help=None, registry=DEFAULT_REGISTRY):
+def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=None, registry=DEFAULT_REGISTRY):
     """
     Command decorator.
 
@@ -1104,7 +1117,7 @@ def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, help
     :param aliases: List of command aliases
     :param patterns: Regex patterns.
     :param bindings: Bindings.
-    :param help: Helptext.
+    :param doc: Helptext.
     :param registry: Which :class:`CommandRegistry` the command will be registered in.  None disables registration.
     :return: fn.function or fn
     """
@@ -1115,8 +1128,8 @@ def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, help
     c.aliases = (aliases or []) + list(reversed(fn.aliases))
     c.patterns = (patterns or []) + list(reversed(fn.patterns))
     c.bindings = (bindings or []) + list(reversed(fn.bindings))
-    c.help = "\n".join(([help] if help else []) + list(reversed(fn.help)))
-    c.finish(altname = fn.function.__name__)
+    c.doc = "\n".join(([doc] if doc else []) + list(reversed(fn.help)))
+    c.finish(altname=fn.function.__name__)
     if registry:
         registry.register(c)
     return fn.function
@@ -1132,7 +1145,7 @@ def bind(fn, paramstring, label=None, summary=None):
     :param summary: Optional usage summary for help.
     :return:
     """
-    fn.bindings.append(CommandBinding(fn.function, paramstring, label, summary))
+    fn.bindings.append(Binding(fn.function, paramstring, label, summary))
 
 
 @chain_decorator
@@ -1158,10 +1171,11 @@ def match(fn, *patterns):
 
 
 @chain_decorator
-def help(fn, helptext):
+def doc(fn, helptext):
     """
     Adds helptext to the pending command.
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param helptext: Helptext to add.
     :return:
     """
+    fn.help.append(helptext)
