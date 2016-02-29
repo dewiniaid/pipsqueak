@@ -3,8 +3,6 @@ Database support module.
 """
 import functools
 import re
-import os.path
-import urllib.parse
 
 import sqlalchemy as sa
 from sqlalchemy import sql, orm, schema
@@ -12,23 +10,24 @@ from sqlalchemy.ext.declarative import as_declarative, declared_attr
 import alembic.command
 import alembic.config
 
-
 def setup(bot):
     """
     Initial SQLAlchemy setup for this bot session.  Also performs in-place db upgrades.
 
-    :param bot: Sopel bot
-    :return: Nothing
+    :param bot: IRC Bot instance, used for configuration
     """
+    global engine, session_factory
     url = bot.config.ratbot.database
     if not url:
         raise ValueError("Database is not configured.")
 
     # Schema migration/upgrade
-    cfg = alembic.config.Config(bot.config.ratbot.alembic or "alembic.ini")
+    cfg = alembic.config.Config(bot.config.ratbot.alembic)
     cfg.set_main_option("sqlalchemy.url", url)
     alembic.command.upgrade(cfg, "head")
-    bot.memory['ratbot']['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url)))
+
+    engine = sa.create_engine(url)
+    bot.data['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url)))
 
     db = get_session(bot)
     status = get_status(db)
@@ -42,10 +41,8 @@ def setup(bot):
 def get_session(bot):
     """
     Returns a database session.
-
-    :param bot: Bot to examine
     """
-    return bot.memory['ratbot']['db']()
+    return bot.data['db']()
 
 
 def with_session(fn=None):

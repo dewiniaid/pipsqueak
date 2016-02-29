@@ -26,40 +26,30 @@ from ratlib.db import with_session, Starsystem, StarsystemPrefix, get_status
 from ratlib.starsystem import refresh_database, scan_for_systems, ConcurrentOperationError
 from ratlib.autocorrect import correct
 import re
-
-
-def configure(config):
-    ratlib.sopel.configure(config)
+from ratbot import *
+from ircbot.commands import UsageError
 
 
 def setup(bot):
-    ratlib.sopel.setup(bot)
-
-    bot.memory['ratbot']['searches'] = SopelMemory()
-    bot.memory['ratbot']['systemFile'] = ratlib.sopel.makepath(bot.config.ratbot.workdir, 'systems.json')
-
     frequency = int(bot.config.ratbot.edsm_autorefresh or 0)
     if frequency > 0:
-        interval(frequency)(task_sysrefresh)
+        bot.eventloop.schedule_periodically(frequency, task_sysrefresh, bot)
 
-
-@commands('search')
-@example('!search lave','')
+@command('search')
+@bind('<system:line>', summary='Searches for similarly-named starsystems.')
 @with_session
-def search(bot, trigger, db=None):
+def search(event, db, system):
     """
     Searches for system name matches.
     """
-
-    system = trigger.group(2)
     if system:
         system = re.sub(r'\s\s+', ' ', system.strip())
     if not system:
-        bot.reply("Usage: {} <name of system>".format(trigger.group(1)))
+        raise UsageError()
 
     if len(system) > 100:
         # Postgres has a hard limit of 255, but this is long enough.
-        bot.reply("System name is too long.")
+        event.reply("System name is too long.")
 
     # Try autocorrection first.
     result = correct(system)
@@ -68,7 +58,6 @@ def search(bot, trigger, db=None):
     system_name = '"{}"'.format(system)
     if result.fixed:
         system_name += " (autocorrected)"
-
     system = system.lower()
 
     # Levenshtein expression
@@ -83,20 +72,19 @@ def search(bot, trigger, db=None):
         .order_by(expr.asc())
     )[:max_results]
 
-
     if result:
-        return bot.say("Nearest matches for {system_name} are: {matches}".format(
+        return event.reply("Nearest matches for {system_name} are: {matches}".format(
             system_name=system_name,
             matches=", ".join('"{0.Starsystem.name}" [{0.distance}]'.format(row) for row in result)
         ))
-    return bot.say("No similar results for {system_name}".format(system_name=system_name))
+    return event.reply("No similar results for {system_name}".format(system_name=system_name))
 
 
 def refresh_time_stats(bot):
     """
     Returns formatted stats on the last refresh.
     """
-    stats = bot.memory['ratbot']['stats'].get('starsystem_refresh')
+    stats = bot.data['ratbot']['stats'].get('starsystem_refresh')
     if not stats:
         return "No starsystem refresh stats are available."
     return (
@@ -105,9 +93,10 @@ def refresh_time_stats(bot):
     )
 
 
-@commands('sysstats')
+@command('sysstats')
+@bind('what=count/bloom/refresh/all')
 @with_session
-def cmd_sysstats(bot, trigger, db=None):
+def cmd_sysstats(event, what='count', db=None):
     """Diagnostics and statistics."""
     def ct(table, *filters):
         result = db.query(sql.func.count()).select_from(table)
@@ -115,13 +104,17 @@ def cmd_sysstats(bot, trigger, db=None):
             result = result.filter(*filters)
         return result.scalar()
 
+    stats = event.bot.data['ratbot']['stats']
+
+    what = what.lower()
     all_options = {'count', 'bloom', 'refresh', 'all'}
-    options = (set((trigger.group(2) or '').lower().split(' ')) & all_options) or {'count'}
+    options = (set((what or '').lower().split(' ')) & all_options) or {'count'}
+
     if 'all' in options:
         options = all_options
 
     if 'count' in options:
-        stats = {
+        count_stats = {
             'excluded': (
                 db.query(sql.func.count(Starsystem.id))
                 .join(StarsystemPrefix, StarsystemPrefix.id == Starsystem.prefix_id)
@@ -135,29 +128,28 @@ def cmd_sysstats(bot, trigger, db=None):
             'prefixes': ct(StarsystemPrefix),
             'one_word': ct(StarsystemPrefix, StarsystemPrefix.word_ct == 1)
         }
-        stats['pct'] = 0 if not stats['count'] else stats['excluded'] / stats['count']
+        count_stats['pct'] = 0 if not count_stats['count'] else count_stats['excluded'] / count_stats['count']
 
-        num_systems = ct(Starsystem)
-        bot.say(
+        event.reply(
             "{count} starsystems under {prefixes} unique prefixes."
             " {one_word} single word systems. {excluded} ({pct:.0%}) systems excluded from system name detection."
-            .format(**stats)
+            .format(**count_stats)
         )
 
     if 'refresh' in options:
-        bot.say(refresh_time_stats(bot))
+        event.reply(refresh_time_stats(event.bot))
 
     if 'bloom' in options:
-        stats = bot.memory['ratbot']['stats'].get('starsystem_bloom')
-        bloom = bot.memory['ratbot'].get('starsystem_bloom')
+        bloom_stats = stats.get('starsystem_bloom')
+        bloom = event.bot.data['ratbot']['starsystem_bloom']
 
-        if not stats or not bloom:
-            bot.say("Bloom filter stats are unavailable.")
+        if not bloom_stats or not bloom:
+            event.reply("Bloom filter stats are unavailable.")
         else:
-            bot.say(
+            event.reply(
                 "Bloom filter generated in {time:.2f} seconds. k={k}, m={m}, n={entries}, {numset} bits set,"
                 " {pct:.2%} false positive chance."
-                .format(k=bloom.k, m=bloom.m, pct=bloom.false_positive_chance(), numset=bloom.setbits, **stats)
+                .format(k=bloom.k, m=bloom.m, pct=bloom.false_positive_chance(), numset=bloom.setbits, **bloom_stats)
             )
 
 def task_sysrefresh(bot):
@@ -167,31 +159,32 @@ def task_sysrefresh(bot):
         pass
 
 
-@commands('sysrefresh')
+@command('sysrefresh')
+@bind('[force=-f]', summary='Refresh the starsystme list (-f: force)')
 @with_session
-def cmd_sysrefresh(bot, trigger, db=None):
+def cmd_sysrefresh(event, force=False, db=None):
     """
     Refreshes the starsystem database if you have halfop or better.  Reports the last refresh time otherwise.
 
     -f: Force refresh even if data is stale.  Requires op.
     """
-    access = ratlib.sopel.best_channel_mode(bot, trigger.nick)
-    privileged = access & (HALFOP | OP)
+    # TODO: Reimplement access checking
+    privileged = True
+    # access = ratlib.sopel.best_channel_mode(bot, trigger.nick)
+    # privileged = access & (HALFOP | OP)
     msg = ""
 
     if privileged:
         try:
             refreshed = refresh_database(
-                bot,
-                force=access & OP and trigger.group(2) and trigger.group(2) == '-f',
-                callback=lambda: bot.say("Starting starsystem refresh...")
+                event, force=bool(force), callback=lambda: event.reply("Starting starsystem refresh...")
             )
             if refreshed:
-                bot.say(refresh_time_stats(bot))
+                event.reply(refresh_time_stats(event.bot))
                 return
             msg = "Not yet.  "
         except ConcurrentOperationError:
-            bot.say("A starsystem refresh operation is already in progress.")
+            event.reply("A starsystem refresh operation is already in progress.")
             return
 
     when = get_status(db).starsystem_refreshed
@@ -202,17 +195,18 @@ def cmd_sysrefresh(bot, trigger, db=None):
         msg += "The starsystem database was refreshed at {} ({})".format(
             ratlib.format_timestamp(when), ratlib.format_timedelta(when)
         )
-    bot.say(msg)
+    event.reply(msg)
 
-@commands('scan')
-def cmd_scan(bot, trigger):
+
+@command('scan')
+@bind('<text:line>')
+def cmd_scan(event, trigger, text):
     """
     Used for system name detection testing.
     """
-    if not trigger.group(2):
-        bot.reply("Usage: {} <line of text>".format(trigger.group(1)))
-
-    line = trigger.group(2).strip()
-    results = scan_for_systems(bot, line)
-    bot.say("Scan results: {"
-              "}".format(", ".join(results) if results else "no match found"))
+    if text:
+        text = text.strip()
+    if not text:
+        raise UsageError()
+    results = scan_for_systems(event, text)
+    event.reply("Scan results: {}".format(", ".join(results) if results else "no match found"))

@@ -92,28 +92,28 @@ def _refresh_database(bot, force=False, callback=None, background=False, db=None
     :param db: Database handle
     """
     start = time()
-    edsm_url = bot.config.ratbot.edsm_url or "http://edsm.net/api-v1/systems?coords=1"
     status = get_status(db)
 
-    edsm_maxage = bot.config.ratbot.maxage or 60*12*12
     if not (
         force or
         not status.starsystem_refreshed or
-        (datetime.datetime.now(tz=datetime.timezone.utc) - status.starsystem_refreshed).total_seconds() > edsm_maxage
+        (
+            ((datetime.datetime.now(tz=datetime.timezone.utc) - status.starsystem_refreshed).total_seconds()) >
+            bot.config.ratbot.edsm_maxage
+        )
     ):
-        # No refresh needed.
         return False
 
     if callback:
         callback()
 
     if background:
-        return bot.memory['ratbot']['executor'].submit(
+        return bot.data['ratbot']['executor'].submit(
             _refresh_database, bot, force=True, callback=None, background=False
         )
 
     fetch_start = time()
-    data = requests.get(edsm_url).json()
+    data = requests.get(bot.config.ratbot.edsm_url).json()
     fetch_end = time()
     # with open('run/systems.json') as f:
     #     import json
@@ -229,7 +229,7 @@ def _refresh_database(bot, force=False, callback=None, background=False, db=None
     }
     stats['misc'] = (end - start) - sum(stats.values())
     stats['all'] = end - start
-    bot.memory['ratbot']['stats']['starsystem_refresh'] = stats
+    bot.data['ratbot']['stats']['starsystem_refresh'] = stats
     return True
 
 
@@ -253,8 +253,8 @@ def refresh_bloom(bot, db):
     #     "Recomputing bloom filter took {} seconds.  {}/{} bits, {} hashes, {} false positive chance"
     #     .format(end-start, bloom.setbits, bloom.bits, hashes, bloom.false_positive_chance())
     # )
-    bot.memory['ratbot']['starsystem_bloom'] = bloom
-    bot.memory['ratbot']['stats']['starsystem_bloom'] = {'entries': count, 'time': end - start}
+    bot.data['ratbot']['starsystem_bloom'] = bloom
+    bot.data['ratbot']['stats']['starsystem_bloom'] = {'entries': count, 'time': end - start}
     return bloom
 
 
@@ -291,7 +291,7 @@ def scan_for_systems(bot, line, min_ratio=0.05, min_length=6):
     words = list(filter(None, re.split(r'\W*\s+\W*', ' ' + line.lower() + ' ')))
 
     # Check for words that are in the bloom filter.  Make a note of their location in the word list.
-    bloom = bot.memory['ratbot']['starsystem_bloom']
+    bloom = bot.data['ratbot']['starsystem_bloom']
     candidates = {}
     for ix, word in enumerate(words):
         if word in candidates:
@@ -304,7 +304,7 @@ def scan_for_systems(bot, line, min_ratio=0.05, min_length=6):
         return set()
 
     # Still here, so find prefixes in the database
-    db = get_session(bot)
+    db = get_session()
     results = {}
     try:
         # Find matching prefixes
