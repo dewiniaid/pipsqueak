@@ -1,6 +1,6 @@
 #coding: utf8
 """
-rat-search.py - Elite Dangerous System Search module.
+search.py - Elite Dangerous System Search module.
 Copyright 2015, Dimitri "Tyrope" Molenaars <tyrope@tyrope.nl>
 Licensed under the Eiffel Forum License 2.
 

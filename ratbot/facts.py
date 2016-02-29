@@ -1,6 +1,6 @@
 #coding: utf8
 """
-rat-facts.py - Fact reciting module
+facts.py - Fact reciting module
 Copyright 2015, Dimitri "Tyrope" Molenaars <tyrope@tyrope.nl>
 Copyright 2016, Daniel "Dewin" Grace
 Licensed under the Eiffel Forum License 2.

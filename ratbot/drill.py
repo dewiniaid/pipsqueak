@@ -1,6 +1,6 @@
 #coding: utf8
 """
-rat-board.py - Fuel Rats Cases module.
+board.py - Fuel Rats Cases module.
 Copyright 2015, Dimitri "Tyrope" Molenaars <tyrope@tyrope.nl>
 Licensed under the Eiffel Forum License 2.
 

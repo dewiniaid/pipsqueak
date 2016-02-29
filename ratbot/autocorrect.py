@@ -1,6 +1,6 @@
 #coding: utf8
 """
-rat-autocorrect.py - System name autocorrection.
+autocorrect.py - System name autocorrection.
 Copyright 2016, Daniel "dewin" Grace
 
 Licensed under the Eiffel Forum License 2.
