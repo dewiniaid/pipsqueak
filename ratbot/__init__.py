@@ -26,10 +26,16 @@ class RatbotConfig(ircbot.ConfigSection):
         self.edsm_maxage = section.getint('edsm_maxage', 12*60*60)
         self.edsm_autorefresh = section.getint('edsm_autorefresh', 4*60*60)
 
+        self.version_string = section.get('version_string')
+        self.version_file = section.get('version_file')
+        self.version_cmd = section.get('version_cmd')
+        self.version_git = section.get('version_git', 'git')
+
 
 def setup(filename):
     global bot, command, rule
     bot = ircbot.Bot(filename=filename)
+    ircbot.add_help_command(bot)
     command = bot.command
     rule = bot.rule
     bot.config.section('ratbot', RatbotConfig)
@@ -53,7 +59,7 @@ def setup(filename):
             if bot.config.ratbot.version_cmd:
                 cmd = bot.config.ratbot.version_cmd
             else:
-                cmd = shlex.quote(bot.config.ratbot.version_git or 'git') + " describe --tags --long --always"
+                cmd = shlex.quote(bot.config.ratbot.version_git) + " describe --tags --long --always"
             output = subprocess.check_output(cmd, cwd=path, shell=True, universal_newlines=True)
             version = output.strip().split('\n')[0].strip()
     except Exception as ex:

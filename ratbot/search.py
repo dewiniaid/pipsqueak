@@ -36,7 +36,7 @@ def setup(bot):
         bot.eventloop.schedule_periodically(frequency, task_sysrefresh, bot)
 
 @command('search')
-@bind('<system:line>', summary='Searches for similarly-named starsystems.')
+@bind('<system:line>', 'Searches for similarly-named starsystems.')
 @with_session
 def search(event, db, system):
     """
@@ -160,7 +160,7 @@ def task_sysrefresh(bot):
 
 
 @command('sysrefresh')
-@bind('[force=-f]', summary='Refresh the starsystme list (-f: force)')
+@bind('[force=-f]', 'Refresh the starsystme list (-f: force)')
 @with_session
 def cmd_sysrefresh(event, force=False, db=None):
     """
