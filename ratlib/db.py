@@ -10,6 +10,7 @@ from sqlalchemy.ext.declarative import as_declarative, declared_attr
 import alembic.command
 import alembic.config
 
+
 def setup(bot):
     """
     Initial SQLAlchemy setup for this bot session.  Also performs in-place db upgrades.

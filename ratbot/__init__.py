@@ -7,7 +7,7 @@ import ratlib.db
 import ratlib.starsystem
 
 # __all__ = ['alias', 'match', 'bind', 'doc', 'bot', 'command', 'rule']
-event = None
+bot = None
 rule = None
 command = None
 
@@ -28,19 +28,19 @@ class RatbotConfig(ircbot.ConfigSection):
 
 
 def setup(filename):
-    global event, command, rule
-    event = ircbot.Bot(filename=filename)
-    command = event.command
-    rule = event.rule
-    event.config.section('ratbot', RatbotConfig)
+    global bot, command, rule
+    bot = ircbot.Bot(filename=filename)
+    command = bot.command
+    rule = bot.rule
+    bot.config.section('ratbot', RatbotConfig)
 
     # Attempt to determine some semblance of a version number.
     version = None
     try:
-        if event.config.ratbot.version_string:
-            version = event.config.ratbot.version_string
-        elif event.config.ratbot.version_file:
-            with open(event.config.ratbot.version_file, 'r') as f:
+        if bot.config.ratbot.version_string:
+            version = bot.config.ratbot.version_string
+        elif bot.config.ratbot.version_file:
+            with open(bot.config.ratbot.version_file, 'r') as f:
                 version = f.readline().strip()
         else:
             import shlex
@@ -50,10 +50,10 @@ def setup(filename):
 
             path = os.path.abspath(os.path.dirname(inspect.getframeinfo(inspect.currentframe()).filename))
 
-            if event.config.ratbot.version_cmd:
-                cmd = event.config.ratbot.version_cmd
+            if bot.config.ratbot.version_cmd:
+                cmd = bot.config.ratbot.version_cmd
             else:
-                cmd = shlex.quote(event.config.ratbot.version_git or 'git') + " describe --tags --long --always"
+                cmd = shlex.quote(bot.config.ratbot.version_git or 'git') + " describe --tags --long --always"
             output = subprocess.check_output(cmd, cwd=path, shell=True, universal_newlines=True)
             version = output.strip().split('\n')[0].strip()
     except Exception as ex:
@@ -63,21 +63,21 @@ def setup(filename):
 
     print("Starting Ratbot version " + version)
 
-    event.data['ratbot'] = {
+    bot.data['ratbot'] = {
         'executor': concurrent.futures.ThreadPoolExecutor(max_workers=10),
         'version': version,
         'stats': {'started': datetime.datetime.now(tz=datetime.timezone.utc)}
     }
 
-    ratlib.db.setup(event)
-    ratlib.starsystem.refresh_bloom(event)
+    ratlib.db.setup(bot)
+    ratlib.starsystem.refresh_bloom(bot)
     ratlib.starsystem.refresh_database(
-        event,
+        bot,
         callback=lambda: print("EDSM database is out of date.  Starting background refresh."),
         background=True
     )
 
 
 def start():
-    event.connect()
-    event.handle_forever()
+    bot.connect()
+    bot.handle_forever()
