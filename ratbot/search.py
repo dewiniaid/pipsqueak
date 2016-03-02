@@ -9,19 +9,12 @@ http://sopel.chat/
 """
 
 #Python core imports
-import json
-import os
 import datetime
-
-#Sopel imports
-from sopel.module import commands, interval, example, NOLIMIT, HALFOP, OP
-from sopel.tools import SopelMemory
 
 from sqlalchemy import sql, orm
 
 import ratlib
 import ratlib.sopel
-from ratlib import friendly_timedelta
 from ratlib.db import with_session, Starsystem, StarsystemPrefix, get_status
 from ratlib.starsystem import refresh_database, scan_for_systems, ConcurrentOperationError
 from ratlib.autocorrect import correct
@@ -36,11 +29,21 @@ def setup(bot):
         bot.eventloop.schedule_periodically(frequency, task_sysrefresh, bot)
 
 @command('search')
+@doc(
+    "Searches for similarly-named starsystems.  The current implementation uses levenshtein distance, which is a"
+    " measure of how many additions, subtractions or substitutions it would take to go from the specified system name"
+    " to an actual system name.  The 10 closest-matching system names are returned sorted by distance (lower distance"
+    " equals a closer match)."
+)
 @bind('<system:line>', 'Searches for similarly-named starsystems.')
 @with_session
-def search(event, db, system):
+def search(event, system, db=None):
     """
     Searches for system name matches.
+
+    :param event:
+    :param db:
+    :param system: System to search for.
     """
     if system:
         system = re.sub(r'\s\s+', ' ', system.strip())
@@ -62,7 +65,7 @@ def search(event, db, system):
 
     # Levenshtein expression
     max_distance = 10
-    max_results = 4
+    max_results = 10
     expr = sql.func.levenshtein_less_equal(Starsystem.name_lower, system, max_distance)
 
     # Query

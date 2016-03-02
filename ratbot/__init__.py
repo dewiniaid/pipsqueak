@@ -6,7 +6,7 @@ import ratlib
 import ratlib.db
 import ratlib.starsystem
 
-# __all__ = ['alias', 'match', 'bind', 'doc', 'bot', 'command', 'rule']
+__all__ = ['alias', 'match', 'bind', 'doc', 'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start']
 bot = None
 rule = None
 command = None
