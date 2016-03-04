@@ -1,5 +1,5 @@
 requests==2.8.1
-sopel
+pydle
 ipython
 iso8601
 sqlalchemy

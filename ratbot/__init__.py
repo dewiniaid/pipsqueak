@@ -2,6 +2,7 @@ import datetime
 import concurrent.futures
 import ircbot
 from ircbot.commands import alias, match, bind, doc
+import ircbot.modules.core
 import ratlib
 import ratlib.db
 import ratlib.starsystem
@@ -32,14 +33,58 @@ class RatbotConfig(ircbot.ConfigSection):
         self.version_git = section.get('version_git', 'git')
 
 
+class Event(ircbot.Event):
+    @property
+    def quiet(self):
+        return self.prefix == self.bot.config.ratbot.quiet_command
+
+    def qsay(self, *args, **kwargs):
+        """
+        Same as say() if quiet is not set or there's no channel, otherwise same as unotice()
+        """
+        if self.quiet or not self.channel:
+            return self.unotice(*args, **kwargs)
+        return self.say(*args, **kwargs)
+
+    def qnotice(self, *args, **kwargs):
+        """
+        Same as notice() if quiet is not set, otherwise same as unotice()
+        """
+        if self.quiet:
+            return self.unotice(*args, **kwargs)
+        return self.notice(*args, **kwargs)
+
+    def qreply(self, *args, **kwargs):
+        """
+        Same as reply() if quiet is not set or there's no channel, otherwise same as unotice()
+        """
+        if self.quiet:
+            return self.unotice(*args, **kwargs)
+        return self.reply(*args, **kwargs)
+
+
 def setup(filename):
     global bot, command, rule
-    bot = ircbot.Bot(filename=filename)
-    ircbot.add_help_command(bot)
+    bot = ircbot.Bot(filename=filename, event_factory=Event)
+    bot.command_registry.register(ircbot.modules.core.help_command)
     command = bot.command
     rule = bot.rule
     bot.config.section('ratbot', RatbotConfig)
 
+    @command('version')
+    @alias('uptime')
+    @bind('', 'Shows bot current version and running time.')
+    def cmd_version(event):
+        from ratlib import format_timedelta, format_timestamp
+        started = bot.data['ratbot']['stats']['started']
+        event.say(
+            "Version {version}, up {delta} since {time}"
+            .format(
+                version=bot.data['ratbot']['version'],
+                delta=format_timedelta(datetime.datetime.now(tz=started.tzinfo) - started),
+                time=format_timestamp(started)
+            )
+        )
     # Attempt to determine some semblance of a version number.
     version = None
     try:
@@ -77,12 +122,13 @@ def setup(filename):
 
     ratlib.db.setup(bot)
     ratlib.starsystem.refresh_bloom(bot)
-    ratlib.starsystem.refresh_database(
+    result = ratlib.starsystem.refresh_database(
         bot,
         callback=lambda: print("EDSM database is out of date.  Starting background refresh."),
         background=True
     )
-
+    if result:
+        result.add_done_callback(lambda *unused: print("Background EDSM refresh completed."))
 
 def start():
     bot.connect()
