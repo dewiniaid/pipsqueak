@@ -35,7 +35,7 @@ def setup(bot):
     " to an actual system name.  The 10 closest-matching system names are returned sorted by distance (lower distance"
     " equals a closer match)."
 )
-@bind('<system:line>', 'Searches for similarly-named starsystems.')
+@bind('<system:line?Starsystem>', 'Searches for similarly-named starsystems.')
 @with_session
 def search(event, system, db=None):
     """
@@ -52,7 +52,7 @@ def search(event, system, db=None):
 
     if len(system) > 100:
         # Postgres has a hard limit of 255, but this is long enough.
-        event.reply("System name is too long.")
+        event.qreply("System name is too long.")
 
     # Try autocorrection first.
     result = correct(system)
@@ -76,11 +76,11 @@ def search(event, system, db=None):
     )[:max_results]
 
     if result:
-        return event.reply("Nearest matches for {system_name} are: {matches}".format(
+        return event.qsay("Nearest matches for {system_name} are: {matches}".format(
             system_name=system_name,
             matches=", ".join('"{0.Starsystem.name}" [{0.distance}]'.format(row) for row in result)
         ))
-    return event.reply("No similar results for {system_name}".format(system_name=system_name))
+    return event.qsay("No similar results for {system_name}".format(system_name=system_name))
 
 
 def refresh_time_stats(bot):
@@ -97,7 +97,15 @@ def refresh_time_stats(bot):
 
 
 @command('sysstats')
-@bind('what=count/bloom/refresh/all')
+@bind('[?what=count/bloom/refresh/all]')
+@doc(
+    "Reports statistics on the starsystem database."
+    "\nCOUNT - Reports information on the number of starsystems in the database and other related statistics."
+    " This is the default."
+    "\nBLOOM - Reports information on the bloom filter (used for name matching)."
+    "\nREFRESH - Reports information on how long the last refresh operation took."
+    "\nALL - Reports all of the above."
+)
 @with_session
 def cmd_sysstats(event, what='count', db=None):
     """Diagnostics and statistics."""
@@ -133,23 +141,23 @@ def cmd_sysstats(event, what='count', db=None):
         }
         count_stats['pct'] = 0 if not count_stats['count'] else count_stats['excluded'] / count_stats['count']
 
-        event.reply(
+        event.qsay(
             "{count} starsystems under {prefixes} unique prefixes."
             " {one_word} single word systems. {excluded} ({pct:.0%}) systems excluded from system name detection."
             .format(**count_stats)
         )
 
     if 'refresh' in options:
-        event.reply(refresh_time_stats(event.bot))
+        event.qsay(refresh_time_stats(event.bot))
 
     if 'bloom' in options:
         bloom_stats = stats.get('starsystem_bloom')
         bloom = event.bot.data['ratbot']['starsystem_bloom']
 
         if not bloom_stats or not bloom:
-            event.reply("Bloom filter stats are unavailable.")
+            event.qsay("Bloom filter stats are unavailable.")
         else:
-            event.reply(
+            event.qsay(
                 "Bloom filter generated in {time:.2f} seconds. k={k}, m={m}, n={entries}, {numset} bits set,"
                 " {pct:.2%} false positive chance."
                 .format(k=bloom.k, m=bloom.m, pct=bloom.false_positive_chance(), numset=bloom.setbits, **bloom_stats)
@@ -163,7 +171,7 @@ def task_sysrefresh(bot):
 
 
 @command('sysrefresh')
-@bind('[force=-f]', 'Refresh the starsystme list (-f: force)')
+@bind('[force=-f]', "Refreshes the starsystem list if it is stale.  (-f: Even if it is not stale.)")
 @with_session
 def cmd_sysrefresh(event, force=False, db=None):
     """
@@ -180,14 +188,14 @@ def cmd_sysrefresh(event, force=False, db=None):
     if privileged:
         try:
             refreshed = refresh_database(
-                event, force=bool(force), callback=lambda: event.reply("Starting starsystem refresh...")
+                event, force=bool(force), callback=lambda: event.qsay("Starting starsystem refresh...")
             )
             if refreshed:
                 event.reply(refresh_time_stats(event.bot))
                 return
             msg = "Not yet.  "
         except ConcurrentOperationError:
-            event.reply("A starsystem refresh operation is already in progress.")
+            event.qreply("A starsystem refresh operation is already in progress.")
             return
 
     when = get_status(db).starsystem_refreshed
@@ -198,11 +206,11 @@ def cmd_sysrefresh(event, force=False, db=None):
         msg += "The starsystem database was refreshed at {} ({})".format(
             ratlib.format_timestamp(when), ratlib.format_timedelta(when)
         )
-    event.reply(msg)
+    event.qsay(msg)
 
 
 @command('scan')
-@bind('<text:line>')
+@bind('<text:line>', "Diagnostic command for testing starsystem matching.")
 def cmd_scan(event, trigger, text):
     """
     Used for system name detection testing.
