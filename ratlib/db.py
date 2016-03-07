@@ -43,6 +43,8 @@ def get_session(bot):
     """
     Returns a database session.
     """
+    if hasattr(bot, 'bot'):
+        return get_session(bot.bot)
     return bot.data['db']()
 
 

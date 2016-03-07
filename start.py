@@ -7,8 +7,8 @@ if __name__ == '__main__':
 
     import ratbot.autocorrect
     import ratbot.search
+    import ratbot.facts
     # import ratbot.board
     # import ratbot.drill
-    # import ratbot.facts
 
     ratbot.start()

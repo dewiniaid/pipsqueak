@@ -1,13 +1,15 @@
 import datetime
 import concurrent.futures
 import ircbot
-from ircbot.commands import alias, match, bind, doc
+from ircbot.commands import alias, match, bind, doc, UsageError, FinalUsageError
 import ircbot.modules.core
 import ratlib
 import ratlib.db
 import ratlib.starsystem
+from pydle import coroutine
 
-__all__ = ['alias', 'match', 'bind', 'doc', 'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start']
+__all__ = ['alias', 'match', 'bind', 'doc', 'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start',
+           'UsageError', 'FinalUsageError']
 bot = None
 rule = None
 command = None

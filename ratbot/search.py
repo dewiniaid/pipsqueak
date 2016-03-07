@@ -14,7 +14,6 @@ import datetime
 from sqlalchemy import sql, orm
 
 import ratlib
-import ratlib.sopel
 from ratlib.db import with_session, Starsystem, StarsystemPrefix, get_status
 from ratlib.starsystem import refresh_database, scan_for_systems, ConcurrentOperationError
 from ratlib.autocorrect import correct
