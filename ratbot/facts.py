@@ -9,7 +9,6 @@ import json
 import os.path
 import re
 import glob
-import functools
 
 from sqlalchemy import exc, inspect
 import ircbot
@@ -128,7 +127,8 @@ def format_fact(fact):
     )
 
 
-@command(patterns=['\S+'])
+@command(aliases=[Pattern(lambda x: True, key='recite_fact', doc='<fact>', priority=1000)])
+# High priority value so we're last.
 @bind('<?rats:line>')
 def cmd_recite_fact(event, rats=None):
     """Recite facts"""
