@@ -1,14 +1,14 @@
 import datetime
 import concurrent.futures
 import ircbot
-from ircbot.commands import alias, match, bind, doc, UsageError, FinalUsageError
+from ircbot.commands import alias, Pattern, bind, doc, UsageError, FinalUsageError
 import ircbot.modules.core
 import ratlib
 import ratlib.db
 import ratlib.starsystem
 from pydle import coroutine
 
-__all__ = ['alias', 'match', 'bind', 'doc', 'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start',
+__all__ = ['alias', 'Pattern', 'bind', 'doc', 'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start',
            'UsageError', 'FinalUsageError']
 bot = None
 rule = None
@@ -68,6 +68,8 @@ class Event(ircbot.Event):
 def setup(filename):
     global bot, command, rule
     bot = ircbot.Bot(filename=filename, event_factory=Event)
+    ircbot.modules.core.help_command.allow_full = False
+    ircbot.modules.core.help_command.category = 'Core'
     bot.command_registry.register(ircbot.modules.core.help_command)
     command = bot.command
     rule = bot.rule
