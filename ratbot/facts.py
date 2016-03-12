@@ -9,12 +9,16 @@ import json
 import os.path
 import re
 import glob
+import logging
 
 from sqlalchemy import exc, inspect
 import ircbot
+from ircbot.commands.exc import *
 
 from ratbot import *
 from ratlib.db import Fact, with_session
+
+logger = logging.getLogger(__name__)
 
 
 class FactConfig(ircbot.ConfigSection):
@@ -186,12 +190,13 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
     if factid:
         # If factid is set, we're using a command that requires it.  Validate it.
         name, _, lang = factid.rpartition('-')
-        if not name:
-            raise FinalUsageError("The first portion of a fact id cannot be empty.")
         if not lang:
-            raise FinalUsageError(
+            raise UsageError("The first portion of a fact id cannot be empty.", final=True)
+        if not name:
+            raise UsageError(
                 "Fact must include a language specifier.  (Perhaps you meant '{}-{}'?)"
-                .format(name, event.bot.config.ratfacts.langs[0])
+                .format(name, event.bot.config.ratfacts.langs[0]),
+                final=True
             )
 
         if action == 'is':
@@ -204,17 +209,24 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
             name = db.merge(Fact(name=name, lang=lang, message=text, author=event.nick))
             is_new = not inspect(name).persistent
             db.commit()
-            event.qsay(("Added " if is_new else "Updated ") + format_fact(name))
+            message = ("Added " if is_new else "Updated ") + format_fact(name)
+            event.qsay(message)
+            logger.info("{event.nick} {message}".format(event=event, message=message))
             return
 
         if action == 'del':
-            name = Fact.find(db, name=name, lang=lang)
-            if name:
-                db.delete(name)
+            fact = Fact.find(db, name=name, lang=lang)
+            if fact:
+                formatted = format_fact(fact)
+                db.delete(fact)
                 db.commit()
-                event.qsay("Deleted " + format_fact(name))
+                event.qsay("Deleted " + formatted)
+                logger.info("{event.nick} deleted fact {formatted}".format(event=event, formatted=formatted))
             else:
-                event.qsay("No such fact '{}'".format(factid))
+                logger.info(
+                    "{event.nick} attempted to delete fact {factid}, but it didn't exist."
+                    .format(event=event, factid=factid)
+                )
             return
 
         raise RuntimeError('Reached code that should be unreachable.')
@@ -223,6 +235,7 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
     if action == 'import':
         # if access & (HALFOP | OP):
         import_facts(event.bot, merge=bool(force))
+        logger.info("{event.nick} is importing facts.".format(event))
         event.qsay("Facts imported.")
         return
         # return bot.reply("Not authorized.")
@@ -237,6 +250,7 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
             if event.channel and not event.quiet:
                 event.reply("Messaging you the complete fact database.")
             event.usay("Language search order is {}".format(", ".join(event.bot.config.ratfacts.langs)))
+            logger.warning("{event.nick} has requested the full fact database.".format(event=event))
             for fact in Fact.findall(db):
                 event.usay(format_fact(fact))
             event.usay("-- End of list --")

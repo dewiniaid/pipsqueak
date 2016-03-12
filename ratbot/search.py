@@ -10,6 +10,8 @@ http://sopel.chat/
 
 #Python core imports
 import datetime
+import functools
+import re
 
 from sqlalchemy import sql, orm
 
@@ -17,15 +19,21 @@ import ratlib
 from ratlib.db import with_session, Starsystem, StarsystemPrefix, get_status
 from ratlib.starsystem import refresh_database, scan_for_systems, ConcurrentOperationError
 from ratlib.autocorrect import correct
-import re
 from ratbot import *
-from ircbot.commands import UsageError
+from ircbot.commands.exc import UsageError
 
+command = functools.partial(command, category='STARSYSTEMS')
 
+import logging
+logger = logging.getLogger(__name__)
+
+@bot.on('connect')
 def setup(bot):
     frequency = int(bot.config.ratbot.edsm_autorefresh or 0)
     if frequency > 0:
         bot.eventloop.schedule_periodically(frequency, task_sysrefresh, bot)
+    bot.off('connect', setup)
+
 
 @command('search')
 @doc(
@@ -45,7 +53,8 @@ def search(event, system, db=None):
     :param system: System to search for.
     """
     if system:
-        system = re.sub(r'\s\s+', ' ', system.strip())
+        system = " ".join(re.findall(r'\S+', system))
+        # system = re.sub(r'\s\s+', ' ', system.strip())
     if not system:
         raise UsageError()
 
@@ -170,7 +179,7 @@ def task_sysrefresh(bot):
 
 
 @command('sysrefresh')
-@bind('[force=-f]', "Refreshes the starsystem list if it is stale.  (-f: Even if it is not stale.)")
+@bind('[?force=-f]', "Refreshes the starsystem list if it is stale.  (-f: Even if it is not stale.)")
 @with_session
 def cmd_sysrefresh(event, force=False, db=None):
     """
@@ -184,13 +193,18 @@ def cmd_sysrefresh(event, force=False, db=None):
     # privileged = access & (HALFOP | OP)
     msg = ""
 
+    def callback():
+        logger.info(
+            "Starting a starsystem refresh (initiated by {event.nick}, force: {force}"
+            .format(event=event, force='YES' if force else 'no')
+        )
+        event.qsay("Starting starsystem refresh...")
+
     if privileged:
         try:
-            refreshed = refresh_database(
-                event, force=bool(force), callback=lambda: event.qsay("Starting starsystem refresh...")
-            )
+            refreshed = refresh_database(event, force=bool(force), callback=callback)
             if refreshed:
-                event.reply(refresh_time_stats(event.bot))
+                # event.reply(refresh_time_stats(event.bot))
                 return
             msg = "Not yet.  "
         except ConcurrentOperationError:

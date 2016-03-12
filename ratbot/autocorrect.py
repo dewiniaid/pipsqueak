@@ -4,7 +4,7 @@ autocorrect.py - System name autocorrection.
 Copyright 2016, Daniel "dewin" Grace
 
 Licensed under the Eiffel Forum License 2.
-
+!
 This is currently a very rudimentary implementation, lacking any sort of configuration.
 """
 from ratbot import *
@@ -17,7 +17,7 @@ def match_system(text):
     return result
 
 
-@rule(match_system, before=['commands'])
+@rule(match_system, priority=-1000)
 def correct_system(event):
     #
     # result = ratlib.autocorrect.correct(event.message)

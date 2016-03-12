@@ -3,13 +3,11 @@ Utilities for handling starsystem names and the like.
 
 This is specifically named 'starsystem' rather than 'system' for reasons that should be obvious.
 """
-
 from time import time
 import datetime
-import itertools
 import re
-import operator
 import threading
+from collections import OrderedDict
 
 
 try:
@@ -18,10 +16,143 @@ except ImportError:
     import collections as collections_abc
 
 import requests
-import sqlalchemy as sa
-from sqlalchemy import sql, orm, schema
+from sqlalchemy import sql, orm
 from ratlib.db import get_status, get_session, with_session, Starsystem, StarsystemPrefix
 from ratlib.bloom import BloomFilter
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class Style:
+    """
+    Defines a starsystem naming style.  Used mostly for statistical analysis currently.
+
+    Starsystem styles are a 32-bit integer for easy representation in the database.  They have the following encoding:
+
+    style_number = n & 0x000000ff  (253 possible styles, 0 is unknown, 255 is reserved)
+    global_flags = n & 0x0000ff00 >> 8
+      1: FLAG_INVALID - Most likely bad data
+    data: n &0xffff >> 16
+      style-dependant.
+    """
+    STYLES = OrderedDict()
+    FLAG_INVALID = 1
+    number = 0
+
+    __slots__ = ('flags', 'data')
+
+    def __init__(self, flags=0, data=0, value=None):
+        if value is not None:
+            self.value = value
+        else:
+            self.flags = flags
+            self.data = data
+
+    @property
+    def value(self):
+        return self.number | (self.flags << 8) | (self.data << 16)
+
+    @value.setter
+    def value(self, value):
+        assert value & 0xff == self.number
+        self.flags = (value & 0xff00) >> 8
+        self.data = value >> 16
+
+    def __int__(self):
+        return self.value
+
+    @classmethod
+    def from_int(cls, value):
+        number = value & 0xff
+        if number not in cls.STYLES:
+            raise ValueError("Unknown style type {}".format(number), number)
+        return cls(value=value)
+
+    @classmethod
+    def from_name(cls, name):
+        """Returns a properly configured Style if the starsystem name matches it, None otherwise"""
+        return cls()
+
+    @classmethod
+    def identify(self, name):
+        for style in self.STYLES.values():
+            result = style.from_name(name)
+            if result:
+                return result
+        return self.from_name(name)
+
+    @classmethod
+    def register(cls, style):
+        cls.STYLES[style.number] = style
+        return style
+
+    def __bool__(self):
+        return self.value != 0
+
+
+@Style.register
+class ProcgenStyle(Style):
+    number = 1
+
+    regex = re.compile(r'(.+) ([a-z][a-z]-[a-z] [a-z]\d+(?:-\d+)?)( .*)?')
+    regex_sector = re.compile('[a-z]+ \d+ sector')
+
+    DFLAG_IS_SECTOR = 1
+
+    @classmethod
+    def from_name(cls, name):
+        result = cls.regex.fullmatch(name)
+        if not result:
+            return None
+        prefix, _, suffix = result.groups()
+        flags = cls.FLAG_INVALID if suffix else 0
+        data = cls.DFLAG_IS_SECTOR if cls.regex_sector.fullmatch(prefix) else 0
+        return cls(flags=flags, data=data)
+
+
+@Style.register
+class TrailingNumberStyle(Style):
+    number = 2
+    regex = re.compile(r'.* \d+')
+
+    @classmethod
+    def from_name(cls, name):
+        if cls.regex.fullmatch(name):
+            return cls()
+        return None
+
+
+@Style.register
+class TwoMassStyle(Style):  # 2MassStyle is not a valid identifier
+    number = 3
+
+    regex = re.compile(r'(.+) (j\d+[-+]\d+)( .*)?')
+
+    @classmethod
+    def from_name(cls, name):
+        result = cls.regex.fullmatch(name)
+        if not result:
+            return None
+        prefix, _, suffix = result.groups()
+        flags = cls.FLAG_INVALID if suffix else 0
+        return cls(flags=flags)
+
+
+@Style.register
+class VNumberStyle(Style):
+    number = 4
+
+    regex = re.compile(r'(v\d+) ([a-z]+)( .*)?')
+
+    @classmethod
+    def from_name(cls, name):
+        result = cls.regex.fullmatch(name)
+        if not result:
+            return None
+        _, _, suffix = result.groups()
+        flags = cls.FLAG_INVALID if suffix else 0
+        return cls(flags=flags)
 
 
 def chunkify(it, size):
@@ -46,7 +177,7 @@ class ConcurrentOperationError(RuntimeError):
     pass
 
 
-def refresh_database(bot, force=False, limit_one=True, callback=None, background=False, _lock=threading.Lock()):
+def refresh_database(bot, force=False, limit_one=True, callback=None, background=True, _lock=threading.Lock()):
     """
     Refreshes the database of starsystems.  Also rebuilds the bloom filter.
     :param bot: Bot instance
@@ -119,69 +250,99 @@ def _refresh_database(bot, force=False, callback=None, background=False, db=None
     #     import json
     #     data = json.load(f)
 
+    logger.debug("Clearing old data from DB.")
+
     db.query(Starsystem).delete()  # Wipe all old data
     db.query(StarsystemPrefix).delete()  # Wipe all old data
+
+    # The list of prefixes isn't too terribly long, so we can just build it as we go.  This contains a set of
+    # (prefix, length) tuples.
+    prefixes = set()
+
     # Pass 1: Load JSON data into stats table.
     systems = []
     ct = 0
 
+    logger.debug("Adding starsystems.")
+
     def _format_system(s):
         nonlocal ct
         ct += 1
-        name, word_ct = re.subn(r'\s+', ' ', s['name'].strip())
-        word_ct += 1
-        return {
-            'name_lower': name.lower(),
+        words = re.findall(r'\S+', s['name'])
+        name = " ".join(words)
+        name_lower = name.lower()
+        rv = {
             'name': name,
-            'x': s.get('x'), 'y': s.get('y'), 'z': s.get('z'),
-            'word_ct': word_ct
+            'name_lower': name_lower,
+            'word_ct': len(words),
+            'style': int(Style.identify(name_lower))
         }
+        rv.update((k, s['coords'].get(k) if 'coords' in s else None) for k in 'xyz')
+        prefixes.add((words[0].lower(), len(words)))
+        return rv
     load_start = time()
     for chunk in chunkify(data, 5000):
         db.bulk_insert_mappings(Starsystem, [_format_system(s) for s in chunk])
         # print(ct)
-    del data
+
     db.connection().execute("ANALYZE " + Starsystem.__tablename__)
     load_end = time()
 
+    logger.debug("Added {} starsystems in {}".format(len(data), load_end - load_start))
+    del data
+
+    logger.debug("Adding starsystem prefixes.")
+
     stats_start = time()
     # Pass 2: Calculate statistics.
-    # 2A: Quick insert of prefixes for single-name systems
-    db.connection().execute(
-        sql.insert(StarsystemPrefix).from_select(
-            (StarsystemPrefix.first_word, StarsystemPrefix.word_ct),
-            db.query(Starsystem.name_lower, Starsystem.word_ct).filter(Starsystem.word_ct == 1).distinct()
-        )
-    )
+    # The new way of doing this should be much faster, but we lose the 'const_words' processing.  That's fine, we
+    # weren't using it.  But just in case we want to use it again, it's commented out below.
+    for chunk in chunkify(prefixes, 1000):
+        db.bulk_insert_mappings(StarsystemPrefix, [{'first_word': prefix[0], 'word_ct': prefix[1]} for prefix in chunk])
 
-    def _gen():
-        for s in (
-            db.query(Starsystem)
-            .order_by(Starsystem.word_ct, Starsystem.name_lower)
-            .filter(Starsystem.word_ct > 1)
-        ):
-            first_word, *words = s.name_lower.split(" ")
-            yield (first_word, s.word_ct), words, s
+    #
+    # # 2A: Quick insert of prefixes for single-name systems
+    # db.connection().execute(
+    #     sql.insert(StarsystemPrefix).from_select(
+    #         (StarsystemPrefix.first_word, StarsystemPrefix.word_ct),
+    #         db.query(Starsystem.name_lower, Starsystem.word_ct).filter(Starsystem.word_ct == 1).distinct()
+    #     )
+    # )
+    #
+    # logger.debug("Completed fast single-word stats.")
+    #
+    # def _gen():
+    #     for s in (
+    #         db.query(Starsystem)
+    #         .order_by(Starsystem.word_ct, Starsystem.name_lower)
+    #         .filter(Starsystem.word_ct > 1)
+    #     ):
+    #         first_word, *words = s.name_lower.split(" ")
+    #         yield (first_word, s.word_ct), words, s
+    #
+    # ct = 0
+    # for chunk in chunkify(itertools.groupby(_gen(), operator.itemgetter(0)), 100):
+    #     for (first_word, word_ct), group in chunk:
+    #         ct += 1
+    #         const_words = None
+    #         for _, words, system in group:
+    #             if const_words is None:
+    #                 const_words = words.copy()
+    #             else:
+    #                 for ix, (common, word) in enumerate(zip(const_words, words)):
+    #                     if const_words[ix] != words[ix]:
+    #                         const_words = const_words[:ix]
+    #                         break
+    #         prefix = StarsystemPrefix(
+    #             first_word=first_word, word_ct=word_ct, const_words=" ".join(const_words)
+    #         )
+    #         db.add(prefix)
+    #     # print(ct)
+    #     db.flush()
 
-    ct = 0
-    for chunk in chunkify(itertools.groupby(_gen(), operator.itemgetter(0)), 100):
-        for (first_word, word_ct), group in chunk:
-            ct += 1
-            const_words = None
-            for _, words, system in group:
-                if const_words is None:
-                    const_words = words.copy()
-                else:
-                    for ix, (common, word) in enumerate(zip(const_words, words)):
-                        if const_words[ix] != words[ix]:
-                            const_words = const_words[:ix]
-                            break
-            prefix = StarsystemPrefix(
-                first_word=first_word, word_ct=word_ct, const_words=" ".join(const_words)
-            )
-            db.add(prefix)
-        # print(ct)
-        db.flush()
+    logger.debug("Assigning starsystem prefixes.")
+    name = Starsystem.name_lower  # Save typing, readable code
+    name_matches = name.op('~')
     db.connection().execute(
         sql.update(
             Starsystem, values={
@@ -192,6 +353,9 @@ def _refresh_database(bot, force=False, callback=None, background=False, db=None
             }
         )
     )
+
+    logger.debug("Calculating statistics.")
+
     db.connection().execute(
         """
         UPDATE {sp} SET ratio=t.ratio, cume_ratio=t.cume_ratio
@@ -212,6 +376,9 @@ def _refresh_database(bot, force=False, callback=None, background=False, db=None
         WHERE t.id=starsystem_prefix.id
         """.format(sp=StarsystemPrefix.__tablename__, s=Starsystem.__tablename__)
     )
+
+    logger.debug("Calcuated name length ratios.")
+
     stats_end = time()
 
     # Update refresh time
@@ -219,6 +386,9 @@ def _refresh_database(bot, force=False, callback=None, background=False, db=None
     status.starsystem_refreshed = sql.func.clock_timestamp()
     db.add(status)
     db.commit()
+
+    logger.debug("Done with starsystem refresh.  Recalculating bloom filter.")
+
     bloom_start = time()
     refresh_bloom(bot)
     bloom_end = time()
@@ -249,10 +419,10 @@ def refresh_bloom(bot, db):
     start = time()
     bloom.update(x[0] for x in db.query(StarsystemPrefix.first_word).distinct())
     end = time()
-    # print(
-    #     "Recomputing bloom filter took {} seconds.  {}/{} bits, {} hashes, {} false positive chance"
-    #     .format(end-start, bloom.setbits, bloom.bits, hashes, bloom.false_positive_chance())
-    # )
+    logger.info(
+        "Recomputing bloom filter took {} seconds.  {}/{} bits, {} hashes, {} false positive chance"
+        .format(end-start, bloom.setbits, bloom.bits, hashes, bloom.false_positive_chance())
+    )
     bot.data['ratbot']['starsystem_bloom'] = bloom
     bot.data['ratbot']['stats']['starsystem_bloom'] = {'entries': count, 'time': end - start}
     return bloom

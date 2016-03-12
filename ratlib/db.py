@@ -3,12 +3,18 @@ Database support module.
 """
 import functools
 import re
+import multiprocessing
 
 import sqlalchemy as sa
 from sqlalchemy import sql, orm, schema
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
-import alembic.command
-import alembic.config
+
+def run_alembic(filename, url):
+    import alembic.command
+    import alembic.config
+    cfg = alembic.config.Config(filename)
+    cfg.set_main_option("sqlalchemy.url", url)
+    alembic.command.upgrade(cfg, "head")
 
 
 def setup(bot):
@@ -23,9 +29,11 @@ def setup(bot):
         raise ValueError("Database is not configured.")
 
     # Schema migration/upgrade
-    cfg = alembic.config.Config(bot.config.ratbot.alembic)
-    cfg.set_main_option("sqlalchemy.url", url)
-    alembic.command.upgrade(cfg, "head")
+    process = multiprocessing.Process(target=run_alembic, args=(bot.config.ratbot.alembic, url))
+    process.start()
+    process.join()
+    if process.exitcode:
+        raise RuntimeError("Alembic subprocess terminated with unexpected error {}".format(process.exitcode))
 
     engine = sa.create_engine(url)
     bot.data['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url)))
@@ -59,6 +67,8 @@ def with_session(fn=None):
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            if 'db' in kwargs:
+                return fn(*args, **kwargs)
             db = get_session(args[0])
             try:
                 return fn(*args, db=db, **kwargs)
@@ -181,7 +191,7 @@ class StarsystemPrefix(Base):
     id = sa.Column(sa.Integer, primary_key=True)
     first_word = sa.Column(sa.Text, nullable=False)
     word_ct = sa.Column(sa.Integer, nullable=False)
-    const_words = sa.Column(sa.Text, nullable=True)
+    # const_words = sa.Column(sa.Text, nullable=True)
     ratio = sa.Column('ratio', sa.Float())
     cume_ratio = sa.Column('cume_ratio', sa.Float())
 StarsystemPrefix.__table__.append_constraint(schema.Index(
@@ -201,6 +211,7 @@ class Starsystem(Base):
         sa.Integer,
         sa.ForeignKey(StarsystemPrefix.id, onupdate='cascade', ondelete='set null'), nullable=True
     )
+    style = sa.Column(sa.Integer, nullable=True)  # Arbitrary style identifier, see starsystem.py
     prefix = orm.relationship(StarsystemPrefix, backref=orm.backref('systems', lazy=True), lazy=True)
 Starsystem.__table__.append_constraint(schema.Index('starsystem__prefix_id', 'prefix_id'))
 Starsystem.__table__.append_constraint(schema.Index('starsystem__name_lower', 'name_lower'))

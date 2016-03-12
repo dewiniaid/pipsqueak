@@ -1,18 +1,31 @@
 import datetime
 import concurrent.futures
 import ircbot
-from ircbot.commands import alias, Pattern, bind, doc, UsageError, FinalUsageError
+from ircbot.commands.commands import Pattern, from_chain, bind, alias, doc
 import ircbot.modules.core
 import ratlib
 import ratlib.db
 import ratlib.starsystem
+import logging
 from pydle import coroutine
 
-__all__ = ['alias', 'Pattern', 'bind', 'doc', 'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start',
-           'UsageError', 'FinalUsageError']
+
+logger = logging.getLogger(__name__)
+
+
+__all__ = [
+    'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start', 'prepare',
+    'Pattern', 'from_chain', 'bind', 'alias', 'doc'
+]
 bot = None
 rule = None
 command = None
+pending = []
+
+def prepare(fn):
+    logger.debug("Preparing " + fn.__module__ + "." + fn.__name__)
+    pending.append(fn)
+    return fn
 
 
 class RatbotConfig(ircbot.ConfigSection):
@@ -25,7 +38,7 @@ class RatbotConfig(ircbot.ConfigSection):
         self.database = section['database']
 
         # TODO: Make these their own config
-        self.edsm_url = section.get('edsm_url', "http://edsm.net/api-v1/systems?coords=1")
+        self.edsm_url = section.get('edsm_url', "http://www.edsm.net/api-v1/systems?coords=1")
         self.edsm_maxage = section.getint('edsm_maxage', 12*60*60)
         self.edsm_autorefresh = section.getint('edsm_autorefresh', 4*60*60)
 
@@ -89,6 +102,31 @@ def setup(filename):
                 time=format_timestamp(started)
             )
         )
+
+    # Temporary
+    @command('whois')
+    @bind('<+nicknames:str>', 'Performs a WHOIS on the specified nicknames and returns a result.')
+    @coroutine
+    def cmd_whois(event, nicknames):
+        result = yield bot.whois(nicknames)
+        print(repr(result))
+        event.usay(repr(result).replace("\n", "  "))
+
+    @command('uprop')
+    @bind('<nickname:str> <property:str>')
+    @coroutine
+    def cmd_uprop(event, nickname, property):
+        result = yield bot.get_user_value(nickname, property)
+        print(repr(result))
+        event.usay(repr(result).replace("\n", "  "))
+
+    @command('udump')
+    @bind('')
+    def cmd_udump(event):
+        import pprint
+        pprint.pprint(event.bot.users)
+        pprint.pprint(event.bot.channels)
+
     # Attempt to determine some semblance of a version number.
     version = None
     try:
@@ -116,7 +154,7 @@ def setup(filename):
     if not version:
         version = '<unknown>'
 
-    print("Starting Ratbot version " + version)
+    logger.info("Starting Ratbot version " + version)
 
     bot.data['ratbot'] = {
         'executor': concurrent.futures.ThreadPoolExecutor(max_workers=10),
@@ -128,12 +166,18 @@ def setup(filename):
     ratlib.starsystem.refresh_bloom(bot)
     result = ratlib.starsystem.refresh_database(
         bot,
-        callback=lambda: print("EDSM database is out of date.  Starting background refresh."),
+        callback=lambda: logger.info("EDSM database is out of date.  Starting background refresh."),
         background=True
     )
     if result:
-        result.add_done_callback(lambda *unused: print("Background EDSM refresh completed."))
+        result.add_done_callback(lambda *unused: logger.info("Background EDSM refresh completed."))
+
 
 def start():
+    global pending
+    for fn in pending:
+        logger.info("Running " + fn.__module__ + "." + fn.__name__)
+        fn(bot)
+    pending = []
     bot.connect()
     bot.handle_forever()
