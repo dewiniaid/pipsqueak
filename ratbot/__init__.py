@@ -8,7 +8,8 @@ import ratlib.db
 import ratlib.starsystem
 import logging
 from pydle import coroutine
-
+import asyncio
+import tornado.platform.asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,9 @@ rule = None
 command = None
 pending = []
 
+
 def prepare(fn):
+    """Decorates functions to be called when we start."""
     logger.debug("Preparing " + fn.__module__ + "." + fn.__name__)
     pending.append(fn)
     return fn
@@ -31,6 +34,7 @@ def prepare(fn):
 class RatbotConfig(ircbot.ConfigSection):
     def read(self, section):
         self.apiurl = section.get('apiurl', None)
+        self.wsurl = section.get('wsurl', None)
         self.alembic = section.get('alembic', 'alembic.ini')
         self.debug_sql = section.getboolean('debug_sql', False)
         self.quiet_command = section.get('quiet_command', '@')
@@ -80,6 +84,12 @@ class Event(ircbot.Event):
 
 def setup(filename):
     global bot, command, rule
+
+    # asyncio.get_event_loop()  # Ensure it's created
+    loop = tornado.platform.asyncio.AsyncIOMainLoop()
+    loop.install()
+    # asyncio.set_event_loop(loop.asyncio_loop)
+
     bot = ircbot.Bot(filename=filename, event_factory=Event)
     ircbot.modules.core.help_command.allow_full = False
     ircbot.modules.core.help_command.category = 'Core'

@@ -27,12 +27,12 @@ command = functools.partial(command, category='STARSYSTEMS')
 import logging
 logger = logging.getLogger(__name__)
 
-@bot.on('connect')
+@prepare
 def setup(bot):
     frequency = int(bot.config.ratbot.edsm_autorefresh or 0)
     if frequency > 0:
+        logger.debug("Scheduling task_sysrefresh every {} seconds.".format(frequency))
         bot.eventloop.schedule_periodically(frequency, task_sysrefresh, bot)
-    bot.off('connect', setup)
 
 
 @command('search')
@@ -171,10 +171,16 @@ def cmd_sysstats(event, what='count', db=None):
                 .format(k=bloom.k, m=bloom.m, pct=bloom.false_positive_chance(), numset=bloom.setbits, **bloom_stats)
             )
 
+
 def task_sysrefresh(bot):
     try:
-        refresh_database(bot, background=True, callback=lambda: print("Starting background EDSM refresh."))
+        result = refresh_database(bot, background=True, callback=lambda: logger.info("Starting periodic EDSM refresh."))
+        if result:
+            result.add_done_callback(lambda: logger.info("Background EDSM refresh complete."))
+        else:
+            logger.info("Not starting periodic EDSM refresh because it is too soon.")
     except ConcurrentOperationError:
+        logger.info("Not starting periodic EDSM refresh because one is already in progress.")
         pass
 
 
