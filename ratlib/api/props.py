@@ -104,6 +104,14 @@ class TrackedProperty:
         """
         return self.remote_name in json
 
+    def commit(self, instance):
+        """
+        Assumes that this property was successfully written and discards any change-tracking state it might have.
+
+        This does nothing on the base properties.
+        """
+        pass
+
 
 class DateTimeProperty(TrackedProperty):
     UTC = datetime.timezone.utc
@@ -165,6 +173,10 @@ class TrackedMetaclass(type):
                     value.name = name
                 value.setup()
                 namespace['_props'].add(value)
+        if '_propnames' not in namespace:
+            namespace['_propnames'] = dict((prop.name, prop) for prop in namespace['_props'])
+
+
         return type.__new__(cls, name, bases, namespace, **kwds)
 
 
@@ -183,8 +195,7 @@ class TrackedBase(metaclass=TrackedMetaclass):
 
     def commit(self):
         for prop in self._changed:
-            if isinstance(prop, InstrumentedProperty):
-                prop.commit(self)
+            prop.commit(self)
         self._changed = set()
 
 
@@ -363,6 +374,7 @@ class InstrumentedSet(EventEmitter, set):
         if not self.replace:
             self.changes[item] = False
         return result
+
 
 for attr in "__iand__ __ixor__ clear difference_update intersection_update symmetric_difference_update pop".split(" "):
     make_wrapper(InstrumentedSet, attr, InstrumentedSet._notify)
