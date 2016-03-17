@@ -1,3 +1,3 @@
 [submodule "pydle-ircbot"]
 	path = ircbot
-	url = D:/git/pydle-ircbot
+	url = git@github.com:dewiniaid/pydle-ircbot.git
