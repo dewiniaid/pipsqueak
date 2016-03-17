@@ -470,6 +470,8 @@ class InstrumentedProperty(TypeCoercedProperty):
     def read(self, instance, json, merge=False):
         if not merge:
             return super().read(instance, json)
+        if self.remote_name not in json:
+            return
         value = self.load(json[self.remote_name])
         return self.merge(instance, value)
 

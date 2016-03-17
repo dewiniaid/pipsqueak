@@ -163,6 +163,8 @@ def setup(filename):
         print("Failed to determine version: " + str(ex))
     if not version:
         version = '<unknown>'
+    else:
+        bot.realname += " " + version
 
     logger.info("Starting Ratbot version " + version)
 

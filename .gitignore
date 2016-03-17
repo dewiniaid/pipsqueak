@@ -1,7 +1,8 @@
 ### Project local exceptions
-# Ignore sopel.cfg so sensitive configuration information doesn't inadvertently get committed.
-# Ship sopel.cfg-dist as a baseline instead
+# Ignore ratbot.cfg so sensitive configuration information doesn't inadvertently get committed.
+# Ship ratbot.cfg-dist as a baseline instead
 sopel.cfg
+ratbot.cfg
 
 # Ignore pid files.
 *.pid

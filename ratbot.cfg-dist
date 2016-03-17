@@ -1,0 +1,102 @@
+[main]
+# Bot's nickname.  If multiple nicknames are specified (separated by commas), they will be tried in order if the
+# primary nick is in use.
+nick = Ratbot
+
+# Channels the bot should be in.  Specify password protected channels as #channel=password
+# channels = #Foo, #Bar, #Secret=mypassword
+
+# Server(s) to connect to.
+# server/port for normal connections.  server/+port for SSL connections.  Separate multiple servers with commas.
+# If specifying multiple servers, the bot will attempt to connect to each of them in order and cycle through if
+# disconnected.
+server = irc.mibbit.com/6667
+
+# Verify SSL certificates?
+verify_ssl = False
+
+# Login method
+# auth_method = sasl
+# auth_username = username
+# auth_password = password
+
+realname = Ratbot
+username = Ratbot
+
+# IRC user modes to set upon connect
+# Most networks support '+B' as a 'user is a bot' indicator.
+# +x is hidden hostname, +p is hide channels, other options vary by network.
+usermode = +B+x
+
+# Command prefix
+# This is a regular expression which matches the beginning of any private message or channel message.
+prefix = [!@]
+
+
+[throttle]
+## Throttling behavior
+#
+# Throttling is handled through a global queue that sends messages when it is available.
+# Additionally, each individual channel and each individual user has their own separate queue.  Messages exit that
+# queue before entering the general queue.
+
+# Message burst and recharge time; rate=0 disables throttling
+burst = 9
+rate = 1.0
+
+# Same for channel messages before they hit the main queue; rate=0 disables throttling
+# Channel messages don't enter
+channel_burst = 0
+channel_rate = 0
+
+# Same for private messages before they hit the main queue; rate=0 disables throttling
+user_burst = 5
+user_rate = 1.25
+
+# Cost of a message: base[, multiplier[, exponent]]
+# Actual cost of a message is base + (length*multiplier*(length**exponent))
+# Can use fractions
+# Default: 1, 0, 0
+cost = 1.0, 1/200, 0
+
+
+[ratbot]
+## Commands whose prefix matches this regex are treated as 'quiet' and either have less output or will output as PMs
+## or notices rather than as channel messages.
+quiet_command = @
+
+## Database connection string.  See SQLAlchemy documentation.
+database = postgresql://ratbot:ratbot@localhost/ratbot
+
+## Uncomment this to make SQLAlchemy echo lots of queries.
+# debug_sql = true
+
+## Websocket selection.
+## If no wsurl is specified, Mecha operates in offline mode.
+## Development API
+# wsurl = http://dev.api.fuelrats.com
+## Production API
+# wsurl = http://api.fuelrats.com
+wsurl = ws://orthanc.localecho.net:7070
+
+## Configuration file for Alembic (used for schema creation/migrations)
+alembic = alembic.ini
+
+# URL to use to retrieve starsystem data.
+edsm_url = http://www.edsm.net/api-v1/systems?coords=1
+
+# Check every edsm_autorefresh seconds to see if the starsystem data is out of date.
+# If the starsystem data is more than edsm_maxage seconds old, start a refresh.
+edsm_maxage = 43200
+edsm_autorefresh = 14400
+
+
+[ratfacts]
+## Filename or directory that will be searched for facts to add to the database if using !fact import
+## This will not override existing facts.
+# filename = facts.json
+filename = facts
+
+## Language search order for facts with no language or where the specified language is not found
+## Comma-separated list
+lang = en

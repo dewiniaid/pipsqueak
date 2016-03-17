@@ -7,7 +7,7 @@ Licensed under the Eiffel Forum License 2.
 This module is built on top of the Sopel system.
 http://sopel.chat/
 """
-
+import abc
 import datetime
 import collections
 import itertools
@@ -18,6 +18,10 @@ import threading
 import operator
 import re
 import functools
+import json
+
+import aiohttp
+from aiohttp.websocket import CLOSE_UNSUPPORTED_DATA, CLOSE_OK, CLOSE_POLICY_VIOLATION
 
 import ircbot
 import ircbot.commands
@@ -30,10 +34,9 @@ from ratlib import friendly_timedelta, format_timestamp
 from ratlib.autocorrect import correct
 from ratlib.starsystem import scan_for_systems
 from ratlib.api.props import *
-import ratlib.api.http
 import ratlib.db
 
-urljoin = ratlib.api.http.urljoin
+import asyncio
 
 bold = lambda x: x  # PLACEHOLDER  FIXME
 
@@ -58,12 +61,23 @@ class RescueParamType(ircbot.commands.ParamType):
         else:
             options = set()
         self.fullresult = fullresult
+        self.open = 'closed_only' not in options
+        self.closed = not self.open or 'closed' in options
         self.create = 'create' in options
-        self.must_exist = 'exists' in options
+        self.boardattrs = []
+        if self.closed:
+            self.boardattrs.append('board_closed')
+        if self.open:
+            self.boardattrs.append('board')
+
+        if not self.open and self.create:
+            raise ParseError("Cannot have a rescue parameter that creates only closed cases.")
 
     def parse(self, event, value):
-        board = event.bot.data['ratboard']['board']
-        result = board.find(value, create=self.create)
+        for attr in self.boardattrs:
+            result = event.bot.data['ratboard'][attr].find(value, create=self.create)
+            if result.rescue is not None:
+                break
         if result.rescue is None:
             if self.create:
                 raise UsageError("Case {} was not found and could not be created.".format(value), final=True)
@@ -87,104 +101,236 @@ def setup(bot):
     bot.data['ratboard'] = {
         'history': collections.OrderedDict(),
         'board': RescueBoard(maxpool=bot.config.ratboard.case_pool_size),
+        'board_closed': ClosedRescueBoard(),
+        'ws': None
     }
 
-    try:
-        refresh_cases(bot)
-    except ratlib.api.http.BadResponseError as ex:
-        import traceback
-        logger.warning("Failed to perform initial sync against the API.  Bad Things might happen.")
-        logger.error(traceback.format_exc())
+    if bot.config.ratbot.wsurl:
+        ws = bot.data['ratboard']['ws'] = WSAPI(bot.config.ratbot.wsurl)
+        asyncio.get_event_loop().call_soon(ws.start)
+    asyncio.get_event_loop().run_until_complete(refresh_cases(bot))
 
 
-def callapi(bot, method, uri, data=None, _fn=ratlib.api.http.call):  # FIXME
-    uri = urljoin(bot.config.ratbot.apiurl, uri)
-    return _fn(method, uri, data)
+class WSAPI:
+    """Websocket API layer"""
+    reference_attr = 'return'  #: Attribute of metadata that will contain our request ID.
+    _default = object()
+
+    def __init__(self, url, *, loop=None, default_timeout=30.0):
+        """
+        :param url: URL we connect to.
+        :param loop: AIO event loop.  `None` means it will be autodetected.  Used as the default loop for .start()
+        :param default_timeout: Default timeout for requests expecting a response.  `None` disables.
+        """
+        self.url = url  #: URL for this websocket
+        self.connection = None  #: Pointer to our current connection.  None if not connected.
+        self.reconnect = True  #: If True, automatically reconnect upon disconnecting.
+        self.task = None  #: Handle to the task created by :meth:`start`
+        self.logger = logger.getChild('WSAPI')  #: Logger.
+        self.loop = loop  #: Event loop
+
+        self.default_timeout = default_timeout  #: How long we wait for a response to any one given request (by default)
+
+        self.connected_future = asyncio.Future()  #: Resolved when we connect and finish initialization tasks.
+
+        #: Stores result futures.  Each item is a tuple of 1 or 2 elements: the future and its asyncio.timeout() future
+        self.result_futures = {}
+        self._counter = itertools.count(1)  # Result ID counter
+
+    def result_id(self):
+        """
+        Returns the next valid result_id.  This gets its own method primarily for the benefit of potential subclasses.
+        """
+        return next(self._counter)
+
+    def start(self, loop=None):
+        self.loop = loop = loop or self.loop or asyncio.get_event_loop()
+        if self.task:
+            raise ValueError("WSAPI task already started.")
+        task = loop.create_task(self.dispatcher())
+
+    async def _terminate(self, reason, code=CLOSE_OK):
+        """
+        Terminate a connection due to error.
+
+        :param reason: Reason for termination
+        :param code: Websocket close code.
+        """
+        self.connected_future = asyncio.Future()
+        self.logger.error("Terminating connection: {}".format(reason))
+        result = await self.connection.close(code)
+        self.connection = None
+        return result
+
+    async def dispatcher(self):
+        """Handles dispatching requests."""
+        self.logger.info("Connecting...")
+        session = aiohttp.ClientSession()
+        first_run = True
+
+        while self.reconnect or first_run:
+            first_run = False
+            try:
+                async with session.ws_connect(self.url) as self.connection:
+                    self.logger.info("Connected.")
+                    self.connected_future.set_result(True)
+                    async for msg in self.connection:
+                        # Validate that the message is something we can handle.
+                        if msg.tp != aiohttp.MsgType.text:
+                            self.logger.debug(
+                                "Received message type {} ({})".format(msg.tp.value, msg.tp.name)
+                            )
+                            if msg.tp == aiohttp.MsgType.binary:
+                                await self._terminate("received unexpected binary data.", CLOSE_UNSUPPORTED_DATA)
+                                break
+                            continue
+                        # Construct and validate JSON
+                        try:
+                            data = json.loads(msg.data)
+                        except ValueError as ex:
+                            await self._terminate(
+                                "received bad JSON message: {}".format(str(ex)), CLOSE_POLICY_VIOLATION
+                            )
+                            break
+                        if not isinstance(data, dict):
+                            await self._terminate("JSON message was not a dict.", CLOSE_POLICY_VIOLATION)
+                            break
+                        if 'meta' not in data:
+                            await self._terminate("Message from API lacked metadata.", CLOSE_POLICY_VIOLATION)
+                            break
+                        result_id = data['meta'].get(self.reference_attr)
+                        # Dispatch result.
+                        if result_id is None:
+                            # TODO: Handle 'default' results (subscriptions!)
+                            continue
+                        try:
+                            result = self.result_futures.get(result_id)
+                        except TypeError as ex:  # Unhashable type, probably.
+                            self.logger.warn("Received a result with an unhashable result_id")
+                            continue
+                        self.logger.debug("[{}] Received Response.".format(result_id))
+                        result.set_result(data)
+            except Exception:
+                self.logger.exception("Error in WS event loop, terminating connection.")
+                raise
+            finally:
+                try:
+                    if self.connection and not self.connection.closed:
+                        self.connection.close()
+                finally:
+                    self.connection = None
+                    if self.connected_future.done():
+                        self.connected_future = asyncio.Future()
+
+    async def send(self, data):
+        """
+        Sends data to the API.  Does not notify upon response.
+
+        :param data: Message to send.  Must be a dict.
+        """
+        await self.connected_future
+        self.connection.send_str(json.dumps(data))
+
+    def _remove_result(self, result_id, *unused):
+        del self.result_futures[result_id]
+
+    async def request(self, data, timeout=_default):
+        """
+        Sends data to the API.  Returns a future that resolves when the timeout expires or the API responds.
+
+        :param data: Message to send.  Must be a dict.
+        :param timeout: Timeout.  `None` disables.  Uses :attr:`default_timeout` by default.
+        """
+        if timeout is self._default:
+            timeout = self.default_timeout
+        if 'meta' not in data:
+            data['meta'] = {}
+        # Assign a result ID
+        if self.reference_attr in data['meta']:
+            result_id = data['meta'][self.reference_attr]
+        else:
+            result_id = data['meta'][self.reference_attr] = self.result_id()
+        assert result_id not in self.result_futures
+
+        if timeout:
+            handler = aiohttp.Timeout(timeout)  # asyncio.timeout is actually missing -- python bug until 3.5.2
+        else:
+            handler = contextlib.ExitStack()
+
+        try:
+            with handler:
+                self.logger.debug("[{}] Submitted Request.".format(result_id))
+                self.result_futures[result_id] = future = asyncio.Future()
+                await self.connected_future
+                self.connection.send_str(json.dumps(data))
+                return await future
+        except asyncio.TimeoutError:
+            self.logger.debug("[{}] Request Timed Out ({} seconds.)".format(result_id, timeout))
+
+        finally:
+            del self.result_futures[result_id]
 
 
 FindRescueResult = collections.namedtuple('FindRescueResult', ['rescue', 'created'])
 
 
-class RescueBoard:
+class RescueBoardBase(metaclass=abc.ABCMeta):
     """
     Manages all attached cases, including API calls.
     """
     INDEX_TYPES = {
         'boardindex': operator.attrgetter('boardindex'),
         'id': operator.attrgetter('id'),
-        'clientnick': lambda x: None if not x.client or not x.client['nickname'] else x.client['nickname'].lower(),
-        'clientcmdr': lambda x: None if not x.client or not x.client['CMDRname'] else x.client['CMDRname'].lower(),
+        'clientnick': lambda x: None if not x.client or not x.client.get('nickname') else x.client['nickname'].lower(),
+        'clientcmdr': lambda x: None if not x.client or not x.client.get('CMDRname') else x.client['CMDRname'].lower(),
     }
 
-    MAX_POOLED_CASES = 10
-
-    def __init__(self, maxpool=None):
-        self._lock = threading.RLock()
+    def __init__(self):
         self.indexes = {k: {} for k in self.INDEX_TYPES.keys()}
-
-        if maxpool is None:
-            maxpool = self.MAX_POOLED_CASES
-
-        # Boardindex pool
-        self.maxpool = maxpool
-        self.counter = itertools.count(start=self.maxpool)
-        self.pool = collections.deque(range(0, self.maxpool))
-
-    def __enter__(self):
-        return self._lock.__enter__()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        return self._lock.__exit__(exc_type, exc_val, exc_tb)
 
     def add(self, rescue):
         """
         Adds the selected case to our indexes.
         """
-        with self:
-            assert rescue.board is None, "Rescue is already assigned."
-            assert rescue.boardindex is None, "Rescue already has a boardindex."
-            # Assign an boardindex
-            rescue.board = self
-            try:
-                rescue.boardindex = self.pool.popleft()
-            except IndexError:
-                rescue.boardindex = next(self.counter)
+        assert rescue.board is None, "Rescue is already assigned."
+        assert rescue.boardindex is None, "Rescue already has a boardindex."
+        # Assign an boardindex
+        rescue.board = self
+        rescue.boardindex = self.alloc_index()
 
-            # Add to indexes
-            for index, fn in self.INDEX_TYPES.items():
-                # FIXME: This will fail horribly if the function raises
-                key = fn(rescue)
-                if key is None:
-                    continue
-                if key in self.indexes[index]:
-                    warnings.warn("Key {key!r} is already in index {index!r}".format(key=key, index=index))
-                    continue
-                self.indexes[index][key] = rescue
+        # Add to indexes
+        for index, fn in self.INDEX_TYPES.items():
+            # FIXME: This will fail horribly if the function raises
+            key = fn(rescue)
+            if key is None:
+                continue
+            if key in self.indexes[index]:
+                logger.warn("Key {key!r} is already in index {index!r}".format(key=key, index=index))
+                continue
+            self.indexes[index][key] = rescue
 
     def remove(self, rescue):
         """
         Removes the selected case from our indexes.
         """
-        with self:
-            # Remove from indexes
-            assert rescue.board is self, "Rescue is not ours."
-            assert rescue.boardindex is not None, "Rescue had no boardindex."
-            for index, fn in self.INDEX_TYPES.items():
-                key = fn(rescue)
-                if key is None:
-                    continue
-                if self.indexes[index].get(key) != rescue:
-                    msg = "Key {key!r} in index {index!r} does not belong to this rescue.".format(key=key, index=index)
-                    warnings.warn(msg)
-                    logger.warning(msg)
-                    continue
-                del self.indexes[index][key]
+        # Remove from indexes
+        assert rescue.board is self, "Rescue is not ours."
+        assert rescue.boardindex is not None, "Rescue had no boardindex."
+        for index, fn in self.INDEX_TYPES.items():
+            key = fn(rescue)
+            if key is None:
+                continue
+            if self.indexes[index].get(key) != rescue:
+                msg = "Key {key!r} in index {index!r} does not belong to this rescue.".format(key=key, index=index)
+                warnings.warn(msg)
+                logger.warning(msg)
+                continue
+            del self.indexes[index][key]
 
-            # Reclaim numbers
-            if rescue.boardindex < self.maxpool:
-                self.pool.append(rescue.boardindex)
-            if not self.indexes['boardindex']:  # Board is clear.
-                self.counter = itertools.count(start=self.maxpool)
+        # Reclaim numbers
+        self.free_index(rescue.boardindex)
+        rescue.boardindex = None
+        rescue.board = None
 
     @contextlib.contextmanager
     def change(self, rescue):
@@ -196,35 +342,34 @@ class RescueBoard:
         with board.change(rescue):
             rescue.client['CMDRname'] = cmdrname
         """
-        with self:
-            assert rescue.board is self
-            snapshot = dict({index: fn(rescue) for index, fn in self.INDEX_TYPES.items()})
-            yield rescue
-            assert rescue.board is self  # In case it was changed
-            for index, fn in self.INDEX_TYPES.items():
-                new = fn(rescue)
-                old = snapshot[index]
-                if old != new:
-                    if old is not None:
-                        if self.indexes[index].get(old) != rescue:
-                            msg = (
-                                "Key {key!r} in index {index!r} does not belong to this rescue."
-                                .format(key=old, index=index)
-                            )
-                            warnings.warn(msg)
-                            logger.warning(msg)
-                        else:
-                            del self.indexes[index][old]
-                    if new is not None:
-                        if new in self.indexes[index]:
-                            msg = (
-                                "Key {key!r} in index {index!r} does not belong to this rescue."
-                                .format(key=new, index=index)
-                            )
-                            warnings.warn(msg)
-                            logger.warning(msg)
-                        else:
-                            self.indexes[index][new] = rescue
+        assert rescue.board is self
+        snapshot = dict({index: fn(rescue) for index, fn in self.INDEX_TYPES.items()})
+        yield rescue
+        assert rescue.board is self  # In case it was changed
+        for index, fn in self.INDEX_TYPES.items():
+            new = fn(rescue)
+            old = snapshot[index]
+            if old != new:
+                if old is not None:
+                    if self.indexes[index].get(old) != rescue:
+                        msg = (
+                            "Key {key!r} in index {index!r} does not belong to this rescue."
+                            .format(key=old, index=index)
+                        )
+                        warnings.warn(msg)
+                        logger.warning(msg)
+                    else:
+                        del self.indexes[index][old]
+                if new is not None:
+                    if new in self.indexes[index]:
+                        msg = (
+                            "Key {key!r} in index {index!r} does not belong to this rescue."
+                            .format(key=new, index=index)
+                        )
+                        warnings.warn(msg)
+                        logger.warning(msg)
+                    else:
+                        self.indexes[index][new] = rescue
 
     def create(self):
         """
@@ -249,25 +394,31 @@ class RescueBoard:
         Otherwise, `search` is treated as a client nickname or a commander name (in that order).  If this still does
         not have a result, a new case is returned (if `create` is True).
         """
-        try:
-            if search and isinstance(search, str) and search[0] == '#':
-                index = int(search[1:])
+        if 'boardindex' in self.indexes:
+            try:
+                if search and isinstance(search, str) and search[0] == '#':
+                    index = int(search[1:])
+                else:
+                    index = int(search)
+            except ValueError:
+                pass
             else:
-                index = int(search)
-        except ValueError:
-            pass
-        else:
-            rescue = self.indexes['boardindex'].get(index, None)
-            return FindRescueResult(rescue, False if rescue else None)
+                rescue = self.indexes['boardindex'].get(index, None)
+                return FindRescueResult(rescue, False if rescue else None)
 
-        if not search:
+        if not search or not isinstance(search, str):
             return FindRescueResult(None, None)
 
-        if search[0] == '@':
+        if 'id' in self.indexes and search[0] == '@':
             rescue = self.indexes['id'].get(search[1:], None),
             return FindRescueResult(rescue, False if rescue else None)
 
-        rescue = self.indexes['clientnick'].get(search.lower()) or self.indexes['clientcmdr'].get(search.lower())
+        clientname = search.lower()
+        rescue = None
+        if rescue is None and 'clientnick' in self.indexes:
+            rescue = self.indexes['clientnick'].get(clientname)
+        if rescue is None and 'clientcmdr' in self.indexes:
+            rescue = self.indexes['clientcmdr'].get(clientname)
         if rescue or not create:
             return FindRescueResult(rescue, False if rescue else None)
 
@@ -284,6 +435,97 @@ class RescueBoard:
         """
         return self.indexes['boardindex'].values()
 
+    @abc.abstractmethod
+    def alloc_index(self):
+        pass
+
+    @abc.abstractmethod
+    def free_index(self, index):
+        pass
+
+
+class RescueBoard(RescueBoardBase):
+    MAX_POOLED_CASES = 10
+
+    def __init__(self, maxpool=None):
+        super().__init__()
+        if maxpool is None:
+            maxpool = self.MAX_POOLED_CASES
+
+        # Boardindex pool
+        self.maxpool = maxpool
+        self.counter = itertools.count(start=self.maxpool)
+        self.pool = collections.deque(range(0, self.maxpool))
+
+    def alloc_index(self):
+        """Retrieves a boardindex from the pool."""
+        try:
+            return self.pool.popleft()
+        except IndexError:
+            return next(self.counter)
+
+    def free_index(self, index):
+        """Returns a boardindex back to the pool."""
+        if index < self.maxpool:
+            self.pool.append(index)
+        if not self.indexes['boardindex']:  # Board is clear.
+            self.counter = itertools.count(start=self.maxpool)
+
+
+class ClosedRescueBoard(RescueBoardBase):
+    """Represents a history of recently closed rescues."""
+    INDEX_TYPES = {
+        'boardindex': operator.attrgetter('boardindex'),
+        'id': operator.attrgetter('id'),
+    }
+
+    def __init__(self, maxval=-10, maxq=1000):
+        """
+        Creates a new :class:`ClosedRescueBoard`.
+
+        :param maxval: Our target number of rescues to keep.  If negative, we start at -1 and count down for boardindex.
+        :param maxq: If we're set as offline, the maximum number of rescues we'll keep.
+
+        When rescues are added to added to a ClosedRescueBoard, they get assigned a slot between 1 and 'maxval'.
+
+        If we're in offline mode, any rescue already in that slot is pushed into the offline queue.  If we're in
+        online mode, the rescue is removed entirely instead.
+
+        If running API-less, we should be "online"
+        """
+        super().__init__()
+        assert maxval
+        self.maxval = maxval
+        self.maxsize = maxq
+        self.lastval = 0
+        self.step = 1 if maxval > 0 else -1
+        self.offline = False
+        self.offline_queue = collections.deque(maxlen=maxq)
+
+    def alloc_index(self):
+        self.lastval += self.step
+        if (self.lastval*self.step) > (self.maxval*self.step):
+            self.lastval = self.step
+        return self.lastval
+
+        oldrescue = self.indexes['boardindex'].get(index)
+        if oldrescue:
+            self.remove(oldrescue)
+            if self.offline:
+                self.offline_queue.append(oldrescue)
+
+        return index
+
+    def free_index(self, index):
+        pass  # noop
+
+    def find(self, search, create=False):
+        return super().find(search, create=False)  # Never can create a closed case via a search.
+
+    def rescue_sort_key(self, rescue):
+        """Works as a key function for sorting rescues in order of most recently added to least."""
+        offset = self.maxval - self.lastval
+        return (rescue.boardindex + offset) % self.maxval
 
 class Rescue(TrackedBase):
     active = TrackedProperty(default=True)
@@ -305,17 +547,29 @@ class Rescue(TrackedBase):
         super().__init__(**kwargs)
         self.boardindex = None
         self.board = None
+        self._lock = asyncio.locks.Lock()
+
+    def __aenter__(self):
+        return self._lock.__aenter__()
+
+    def __aexit__(self, exc_type, exc_val, exc_tb):
+        return self._lock.__aexit__(exc_type, exc_val, exc_tb)
+
+    def _check_if_locked(self):
+        """Squawks loudly if called and we're not currently locked."""
+        if not self._lock.locked():
+            logger.warning("Performing an operation on a rescue that expected us to be locked, but we're not.")
 
     def change(self):
         """
-        Convenience shortcut for performing safe attribute changes (that also update indexes).
+        Convenience shortcut for performing safe attribute changes (that also update indexes).  Same as
 
         ```
         with rescue.change():
             rescue.client['CMDRname'] = 'Foo'
         ```
 
-        If the rescue is not attached to the board, this returns a dummy context manager that does nothing.
+        If the rescue is not attached to a board, this returns a dummy context manager that does nothing.
         """
         if self.board:
             return self.board.change(self)
@@ -325,14 +579,83 @@ class Rescue(TrackedBase):
             yield self
         return _dummy()
 
-    def refresh(self, json, merge=True):
+    def refresh(self, data, merge=True, delta=True, _uselock=True):
+        """
+        Refreshes this `Rescue` from attributes in the JSON `data`
+
+        :param data: JSON data
+        :param merge: Whether to discard changes that conflict with our own pending changes.
+        :param delta: Whether or not to return a delta summarizing all changes.
+        :return:
+        """
+        if not _uselock:
+            self._check_if_locked()
+        if delta:
+            before = self.dump(full=True)
+
         for prop in self._props:
             if isinstance(prop, InstrumentedProperty):
-                prop.read(self, json, merge=merge)
+                prop.read(self, data, merge=merge)
                 continue
             if merge and prop in self._changed:
                 continue  # Ignore incoming data that conflicts with our pending changes.
-            prop.read(self, json)
+            prop.read(self, data)
+
+        if delta:
+            return self.generate_changeset(before, full=True)
+
+    def generate_changeset(self, before, after=None, full=True, props=None):
+        """
+        Given `before` and `after`, which are both dictionaries produced by :meth:`dump`, generate a summary of
+        noteworthy changes.
+
+        :param before: Snapshot of state before change.
+        :param after: Snapshot of state after change.  If `None`, will be produced based on current state.
+        :param full: Passed to :meth:`dump` if creating a snapshot.
+        :param props: Passed to :meth:`dump` if creating a snapshot.
+        """
+        if after is None:
+            after = self.dump(full, props)
+        return self._generate_changeset(before, after)
+
+    @classmethod
+    def _generate_changeset(cls, before, after):
+        """Implements generate_changeset"""
+        def _diff(_before, _after):
+            _result = dict((k, v) for k, v in _after.items() if _before.get(k) != v)
+            _result.update(zip((k for k in _before if k not in _after), itertools.repeat(None)))
+            return _result
+
+        result = _diff(before, after)
+
+        # Handle the set-like attributes that... aren't
+        # These might not be equal due to ordering differences, but they're actually sets so order is
+        # irrelevant
+        for attr in ('unidentifiedRats', 'rats'):
+            if attr not in result:
+                continue
+            b = set(before.get(attr) or [])
+            a = set(after.get(attr) or [])
+            if a == b:
+                del result[attr]
+            else:
+                result[attr] = a
+
+        # Handle CMDRname
+        if 'client' in result:
+            result['client'] = _diff(before.get('client', {}), after.get('client', {}))
+
+        # Handle quotes if it's a simple append.
+        # We can tell this by: after quotes being longer then before quotes, and the first len(a) elements matching.
+        if 'quotes' in result:
+            result['quotes_appended'] = None
+            a = after.get('quotes') or []
+            if a:
+                b = before.get('quotes') or []
+                if len(b) < len(a):
+                    if all(a[ix] == b[ix] for ix in range(len(b))):  # Safe for zero-length.
+                        result['quotes_appended'] = b[len(a):]
+        return result
 
     @classmethod
     def load(cls, json, inst=None):
@@ -344,11 +667,72 @@ class Rescue(TrackedBase):
         inst.refresh(json)
         return inst
 
-    def save(self, full=False, props=None):
-        result = {}
-        props = self._props if full else self._changed
+    def _normalize_props(self, full, props=None):
+        """
+        Compute a list of changed properties for various methods.
+
+        :param full: If True, returns all properties.
+        :param props: If `full` is True, this is ignored.  Otherwise, this overrides the value of `self._changed`
+        :return: A set of properties
+
+        `props` can contain properties by name or the actual property objects.
+        """
+        if full:
+            return self._props
+        if props is None:
+            return self._changed
+        return set(prop if prop in self._props else self._propnames[prop] for prop in props)
+
+    def _dump(self, props):
+        """Internal implementation of dump.  Does not normalize props."""
+        rv = {}
         for prop in props:
-            prop.write(self, result)
+            prop.write(self, rv)
+        return rv
+
+    def dump(self, full=False, props=None):
+        """
+        Dumps this rescue to a dictionary.
+
+        :param full: If True, forces a full save regardless of changed properties.
+        :param props: Overrides changed properties if set
+        :return: Populated dictionary suitable for JSON serialization.
+        """
+        return self._dump(self._normalize_props(full, props))
+
+    async def save(self, ws, full=False, props=None):
+        """
+        Saves this rescue
+
+        :param ws: WSAPI instance to submit the request to.
+        :param full: If True, forces a full save regardless of changed properties.
+        :param props: Overrides changed properties if set
+        :return:
+        """
+        # Fast touch & exit if ws is None
+        if not ws:
+            self.touch()
+            self.commit()
+            return None
+
+        props = self._normalize_props(full, props)
+        if not props:
+            return  # Nothing to do
+
+        request = {}
+        if self.id:
+            request['id'] = self.id
+            request['action'] = 'rescues:update'
+        else:
+            request['action'] = 'rescues:create'
+
+        request['data'] = self._dump(props)
+        result = await ws.request(request)
+        # TODO: Write code that does things if our request does bad things.  Oh, and validate.
+        for prop in props:
+            prop.commit(self)
+        self._changed -= props
+        self.refresh(result['data'])
         return result
 
     @property
@@ -389,54 +773,55 @@ class Rescue(TrackedBase):
         return when
 
 
-def refresh_cases(bot, rescue=None):
+async def refresh_cases(bot, rescue=None):
     """
     Grab all open cases from the API so we can work with them.
+
     :param bot: IRC bot
     :param rescue: Individual rescue to refresh.
     """
-    if not bot.config.ratbot.apiurl:
-        warnings.warn("No API URL configured.  Operating in offline mode.")
-        return  # API disabled.
-    uri = '/api/search/rescues'
-    if rescue is not None:
-        if rescue.id is None:
-            raise ValueError('Cannot refresh a non-persistent case.')
-        uri += "/" + rescue.id
-        data = {}
-    else:
-        data = {'open': True}
-
-    # Exceptions here are the responsibility of the caller.
-    result = callapi(bot, 'GET', uri, data=data)  # FIXME
+    ws = bot.data['ratboard']['ws']
     board = bot.data['ratboard']['board']
 
-    if rescue:
-        if not result['data']:
-            board.remove(rescue)
-        else:
-            with rescue.change():
-                rescue.refresh(result['data'])
+    if not ws:
+        logging.warn("No websocket configured.  Operating in offline mode.")
         return
+    future = ws.request({'action': 'rescues:read', 'data': {'open': True, 'id': '56d4a4852410b38e0490e321'}})
+    result = await future   # FIXME: Need individual rescue refresh as well.
+    print(repr(result))
 
-    with board:
-        # Cases we have but the refresh doesn't.  We'll assume these are closed after winnowing down the list.
-        missing = set(board.indexes['id'].keys())
-        for case in result['data']:
-            id = case['_id']
-            missing.discard(id)  # Case still exists.
-            existing = board.indexes['id'].get(id)
+    # if rescue:
+    #     if not result['data']:
+    #         board.remove(rescue)
+    #     else:
+    #         with rescue.change():
+    #             rescue.refresh(result['data'])
+    #     return
+    if rescue:
+        raise NotImplementedError("Support for refreshing individual rescues is currently disabled.")
 
-            if existing:
+    # Cases we have but the refresh doesn't.  We'll assume these are closed after winnowing down the list.
+    missing = set(board.indexes['id'])
+
+    for case in result['data']:
+        id = case['_id']
+        missing.discard(id)  # Case still exists.
+        # Find our counterpart, which we may or may not have.
+        existing = board.indexes['id'].get(id)
+
+        if existing:
+            async with existing:
                 with existing.change():
                     existing.refresh(case)
                 continue
+        else:
             board.add(Rescue.load(case))
 
-        for id in missing:
-            case = board.indexes['id'].get(id)
-            if case:
-                board.remove(case)
+    for id in missing:
+        case = board.indexes['id'].get(id)
+        if case:
+            board.remove(case)
+            bot.data['ratboard']['board_closed'].add(rescue)
 
 
 class AppendQuotesResult:
@@ -573,7 +958,7 @@ def rule_history(event):
 
 
 @rule(bot.config.ratboard.signal, attr='match', priority=-1000)
-def rule_ratsignal(event):
+async def rule_ratsignal(event):
     """Light the rat signal, somebody needs fuel."""
     if event.channel is None:
         event.qsay("In private messages, nobody can hear you scream.  (HINT: Maybe you should try this in #FuelRats)")
@@ -585,11 +970,7 @@ def rule_ratsignal(event):
         .format(nick=event.nick, tags=", ".join(result.tags()) if result else "<unknown>")
     )
     event.reply('Are you on emergency oxygen? (Blue timer on the right of the front view)')
-    # FIXME
-    # save_case_later(
-    #     bot, result.rescue,
-    #     "API is still not done with ratsignal from {nick}; continuing in background.".format(nick=event.nick)
-    # )
+    await save_or_complain(event, result.rescue)
 
 
 @command('quote')
@@ -632,7 +1013,7 @@ def cmd_quote(event, rescue):
 
 @command('clear', aliases=['close'])
 @bind('<rescue:rescue:exists>', "Marks a case as closed.")
-def cmd_clear(event, rescue):
+async def cmd_clear(event, rescue):
     """
     Mark a case as closed.
     Required parameters: client name or case number.
@@ -642,48 +1023,42 @@ def cmd_clear(event, rescue):
     # FIXME: Should have better messaging
     event.qsay("Case {rescue.client_name} is cleared".format(rescue=rescue))
     rescue.board.remove(rescue)
-    # FIXME
-    # save_case_later(
-    #     bot, rescue,
-    #     "API is still not done with clearing case {!r}; continuing in background.".format(trigger.group(3))
-    # )
+    event.bot.data['ratboard']['board_closed'].add(rescue)
+    await save_or_complain(event, rescue)
 
 
 @command('list')
-@bind('[*options=inactive/names/ids]', "Lists cases, with possible OPTIONS")
+@bind('[*options=inactive/names/ids/closed]', "Lists cases, with possible OPTIONS")
 @bind('[<?shortoptions:str?-OPTIONS>]', "Lists cases, with possible OPTIONS")
 @doc(
     "Lists cases that the bot is currently aware of.  By default, lists only active cases, but you can change this by"
     " specifying OPTIONS."
     "\nNew-style options: Specify 'inactive' to include inactive cases in the list, 'names' to include CMDR names in "
-    " the listing, or 'ids' to include APIs in the list.  You may specify multiple options."
-    "\nOld-style options: -i is equivalent to inactive, -n is equivalent to names, -@ is equivalent to ids.  These can"
-    " be combined (e.g. -in@)"
+    " the listing, or 'ids' to include APIs in the list.  Specify 'closed' to show recently closed cases instead of"
+    " open cases (implies 'inactive').  You may specify multiple options."
+    "\nOld-style options: -i is equivalent to inactive, -n is equivalent to names, -@ is equivalent to ids, -c is"
+    " equivalent to closed.  These can be combined (e.g. -inc@)"
 )
 def cmd_list(event, shortoptions=None, options=None):
     if shortoptions:
         if shortoptions[0] != '-':
             raise UsageError("Unknown list option '{}'".format(shortoptions))
-        show_ids = '@' in shortoptions and bot.config.ratbot.apiurl is not None
+        show_ids = '@' in shortoptions
+        show_closed = 'c' in shortoptions
         show_inactive = 'i' in shortoptions
         show_names = 'n' in shortoptions
     else:
         options = set(option.lower() for option in options) if options else set()
         show_ids = 'ids' in options
+        show_closed = 'closed' in options
         show_inactive = 'inactive' in options
         show_names = 'names' in options
+    show_ids = show_ids and (bot.config.ratbot.wsurl is not None)
+    show_inactive = show_inactive or show_closed
+
     attr = 'client_names' if show_names else 'client_name'
 
-    board = event.bot.data['ratboard']['board']
-
-    def _keyfn(rescue):
-        return not rescue.codeRed, rescue.boardindex
-
-    with board:
-        actives = list(filter(lambda x: x.active, board.rescues))
-        actives.sort(key=_keyfn)
-        inactives = list(filter(lambda x: not x.active, board.rescues))
-        inactives.sort(key=_keyfn)
+    board = event.bot.data['ratboard']['board_closed' if show_closed else 'board']
 
     def format_rescue(rescue):
         cr = "(CR)" if rescue.codeRed else ''
@@ -697,8 +1072,21 @@ def cmd_list(event, shortoptions=None, options=None):
             cr=cr
         )
 
+
+    lists = []
+    if show_closed:
+        lists.append(('recently closed', True, sorted(board.rescues, key=board.rescue_sort_key)))
+    else:
+        def _keyfn(rescue):
+            return not rescue.codeRed, rescue.boardindex
+        lists.append(('active', True, sorted(filter(lambda x: x.active, board.rescues), key=_keyfn)))
+        inactives = list(filter(lambda x: not x.active, board.rescues))
+        if show_inactive:
+            inactives.sort(key=_keyfn)
+        lists.append(('inactive', show_inactive, sorted(filter(lambda x: x.active, board.rescues), key=_keyfn)))
+
     output = []
-    for name, cases, expand in (('active', actives, True), ('inactive', inactives, show_inactive)):
+    for name, expand, cases in lists:
         if not cases:
             output.append("No {name} cases".format(name=name))
             continue
@@ -708,12 +1096,60 @@ def cmd_list(event, shortoptions=None, options=None):
         if expand:
             t += ": " + ", ".join(format_rescue(rescue) for rescue in cases)
         output.append(t)
+
+    if show_closed:
+        output.append("Use " + event.prefix + "reopen <index> to reopen a closed case.")
     event.qsay("; ".join(output))
+
+
+@command('reopen')
+@bind('<rescue:rescue:closed_only>', "Reopens a recently closed case.  Must be specified by index number.")
+@doc(
+    "Reopens a recently closed case by specifying its index number.  There must be no open cases for the client."
+    "  Closed cases are identified by negative indexes (e.g. -1).  Closed cases cannot be modified without reopening"
+    " them first."
+)
+async def cmd_reopen(event, rescue):
+    board = bot.data['ratboard']['board']
+    closed_board = bot.data['ratboard']['board_closed']
+
+    if rescue.board is not closed_board:
+        logger.warn(
+            "Attempting to reopen a case that is not on the closed case board: <{}> {}"
+            .format(event.nick, event.message)
+        )
+        event.reply("I can't reopen that case, because that's not a case that is closed.")
+        return
+
+    INDEX_TYPES = {
+        'boardindex': operator.attrgetter('boardindex'),
+        'id': operator.attrgetter('id'),
+        'clientnick': lambda x: None if not x.client or not x.client.get('nickname') else x.client['nickname'].lower(),
+        'clientcmdr': lambda x: None if not x.client or not x.client.get('CMDRname') else x.client['CMDRname'].lower(),
+    }
+
+    for index, name in (('clientnick', 'Client nickname'), ('clientcmdr', 'Client CMDR name')):
+        v = board.INDEX_TYPES[index](rescue)
+        if v is None:
+            continue
+        if v in board.indexes[index]:
+            event.reply("Unable to reopen case: {} is in use by an existing open case.")
+            return
+
+    rescue.board.remove(rescue)
+    board.add(rescue)
+    rescue.open = True
+    rescue.active = True
+    event.qsay(
+        "Case for {rescue.client_name} is reopened and reactivated as case #{rescue.boardindex}."
+        .format(rescue=rescue)
+    )
+    await save_or_complain(event, rescue)
 
 
 @command('grab')
 @bind('<client:str?client nickname>')
-def cmd_grab(event, client):
+async def cmd_grab(event, client):
     """
     Grab the last line the client said and add it to the case.
     required parameters: client name.
@@ -737,16 +1173,15 @@ def cmd_grab(event, client):
             line=result.added_lines[0]
         )
     )
-    # FIXME
-    # save_case_later(
-    #     event.bot, result.rescue,
-    #     "API is still not done with grab for {rescue.client_name}; continuing in background.".format(rescue=result.rescue)
-    # )
+    await save_or_complain(event, result.rescue)
 
 
 @command('inject', aliases=['open'])
-@bind('<result:fullrescue:create?client> <line:line?message>', "Opens a new text for CLIENT with the opening MESSAGE.")
-def cmd_inject(event, result, line):
+@bind(
+    '<result:fullrescue:create?client> <line:line?message>',
+    "Opens a new case for CLIENT with the opening MESSAGE, or appends the message to their existing case."
+)
+async def cmd_inject(event, result, line):
     result = append_quotes(bot, result, line, create=True)
 
     event.qsay(
@@ -756,18 +1191,14 @@ def cmd_inject(event, result, line):
             line=result.added_lines[0]
         )
     )
-    # FIXME
-    # save_case_later(
-    #     event.bot, result.rescue,
-    #     "API is still not done with inject for {rescue.client_name}; continuing in background.".format(rescue=result.rescue)
-    # )
+    await save_or_complain(event, result.rescue)
 
 
 @command('sub')
 @bind('<rescue:rescue:exists> <lineno:int:0?line number>', "Remove a quote from a case.")
 @bind('<rescue:rescue:exists> <lineno:int:0?line number> <line:line?replacement text>', "Changes a quote in a case.")
 @doc("Removes or replaces a quote in a case.  The first quote in a case is quote 0.")
-def cmd_sub(event, rescue, lineno, line=None):
+async def cmd_sub(event, rescue, lineno, line=None):
     if lineno >= len(rescue.quotes):
         event.qreply('Case only has {} line(s)'.format(len(rescue.quotes)))
         return
@@ -780,11 +1211,10 @@ def cmd_sub(event, rescue, lineno, line=None):
     else:
         rescue.quotes[lineno] = line
         event.qsay("Updated line {}".format(lineno))
-    # FIXME
-    # save_case_later(bot, rescue)
+    await save_or_complain(event, rescue)
 
 
-def cmd_toggle_flag(event, rescue, attr, text=None, truestate=None, falsestate=None):
+async def cmd_toggle_flag(event, rescue, attr, text=None, truestate=None, falsestate=None):
     """
     Toggles a rescue flag.
 
@@ -809,9 +1239,11 @@ def cmd_toggle_flag(event, rescue, attr, text=None, truestate=None, falsestate=N
     state = truestate if result else falsestate
 
     if text:
-        return event.qsay(text.format(rescue=rescue, state=state))
+        event.qsay(text.format(rescue=rescue, state=state))
     else:
-        return event.qsay(state.format(rescue=rescue))
+        event.qsay(state.format(rescue=rescue))
+    await save_or_complain(event, rescue)
+
 from_chain(
     functools.partial(
         cmd_toggle_flag,
@@ -830,7 +1262,7 @@ from_chain(
 )
 
 
-def cmd_change_rats(event, rescue, rats, remove=False, fr=False):
+async def cmd_change_rats(event, rescue, rats, remove=False, fr=False):
     """
     Changes assigned rats on a case.
 
@@ -841,6 +1273,7 @@ def cmd_change_rats(event, rescue, rats, remove=False, fr=False):
     :param fr: True to send a FR message to client (only if not Quiet and in a channel.
     :return:
     """
+    # FIXME: API lookups needed to properly assign rat IDs.
     joined_rats = ", ".join(rats)
     if remove:
         rescue.rats -= set(rats)
@@ -878,7 +1311,7 @@ from_chain(
 
 @command('codered', aliases=['casered', 'cr'])
 @bind('<rescue:rescue:exists>', "Toggles a case's Code Red status.  (Setting CR may trigger some people's highlights!)")
-def cmd_codered(event, rescue):
+async def cmd_codered(event, rescue):
     """
     Toggles the code red status of a case.
     A code red is when the client is so low on fuel that their life support
@@ -891,8 +1324,7 @@ def cmd_codered(event, rescue):
             event.say(", ".join(rescue.rats) + ": This is your case!")
     else:
         event.qsay('{rescue.client_name}\'s case is no longer CR.'.format(rescue=rescue))
-    # FIXME
-    # save_case_later(bot, rescue)
+    await save_or_complain(event, rescue)
 
 
 def cmd_platform(event, rescue, platform):
@@ -927,7 +1359,7 @@ from_chain(
 @command('system', aliases=['sys', 'loc', 'location'])
 @bind('<rescue:rescue:exists> <system:line>', "Sets a rescue's location.")
 @with_session
-def cmd_system(event, rescue, system, db=None):
+async def cmd_system(event, rescue, system, db=None):
     # Try to find the system in EDSM.
     fmt = "Location of {rescue.client_name} set to {rescue.system}"
     result = db.query(ratlib.db.Starsystem).filter(ratlib.db.Starsystem.name_lower == system.lower()).first()
@@ -937,6 +1369,8 @@ def cmd_system(event, rescue, system, db=None):
         fmt += "  (not in EDSM)"
     rescue.system = system
     event.qsay(fmt.format(rescue=rescue))
+
+    await save_or_complain(event, rescue)
     # FIXME
     # save_case_later(
     #     event.bot, rescue,
@@ -946,10 +1380,35 @@ def cmd_system(event, rescue, system, db=None):
     #     )
     # )
 
+async def save_or_complain(event, rescue, message="Failed to save rescue {rescue.boardindex}"):
+    """
+    Saves a rescue, or complains about it
+
+    :param bot: Bot instance
+    :param rescue: Rescue to save
+    :param message: Message to be included in exceptions.  Exception text will be included as well.
+    """
+    try:
+        try:
+            async with rescue:
+                await rescue.save(event.bot.data['ratboard']['ws'])
+        except asyncio.TimeoutError:
+            # TODO: Do something about possibly being disconnected.
+            raise
+        except aiohttp.ClientDisconnectedError:
+            # TODO: Do something about possibly being disconnected.
+            raise
+    except Exception as ex:
+        # Hackish, but works, and the builtin Python logging library does the same thing.
+        if '{rescue' in message:
+            message = message.format(rescue=rescue)
+        event.qsay(message + ": " + str(ex))
+        logger.exception(message)
+
 
 @command('commander', aliases=['cmdr'])
 @bind('<rescue:rescue:exists> <commander:line>', "Sets the client's in-game (CMDR) name.")
-def cmd_commander(event, rescue, commander):
+async def cmd_commander(event, rescue, commander):
     """
     Sets a client's in-game commander name.
     required parameters: Client name or case number, commander name
@@ -957,12 +1416,8 @@ def cmd_commander(event, rescue, commander):
     with rescue.change():
         rescue.client['CMDRname'] = commander
 
-    event.qsay("Client for case {rescue.boardindex} is now CMDR {commander}".format(rescue=rescue, commander=commander))
-    # FIXME
-    # save_case_later(
-    #     event.bot, rescue,
-    #     (
-    #         "API is still not done updating system for {rescue.client_name}; continuing in background."
-    #         .format(rescue=rescue)
-    #     )
-    # )
+    event.qsay(
+        "Client for case {rescue.boardindex} is now CMDR {commander}"
+        .format(rescue=rescue, commander=commander)
+    )
+    await save_or_complain(event, rescue)
