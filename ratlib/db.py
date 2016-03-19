@@ -7,7 +7,9 @@ import multiprocessing
 import logging
 import sqlalchemy as sa
 from sqlalchemy import sql, orm, schema
+from sqlalchemy.orm.collections import InstrumentedSet
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
+from sqlalchemy.ext.associationproxy import association_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +224,67 @@ class Starsystem(Base):
     prefix = orm.relationship(StarsystemPrefix, backref=orm.backref('systems', lazy=True), lazy=True)
 Starsystem.__table__.append_constraint(schema.Index('starsystem__prefix_id', 'prefix_id'))
 Starsystem.__table__.append_constraint(schema.Index('starsystem__name_lower', 'name_lower'))
+
+
+class PrivInherits(Base):
+    parent_id = sa.Column(
+        'parent_id', sa.Integer, sa.ForeignKey('priv.id', onupdate='cascade', ondelete='cascade'), primary_key=True
+    )
+    child_id = sa.Column(
+        sa.Integer, sa.ForeignKey('priv.id', onupdate='cascade', ondelete='cascade'), primary_key=True
+    )
+    parent = orm.relationship(
+        "Priv", foreign_keys=[parent_id], backref=orm.backref('inherits', viewonly=True), viewonly=True
+    )
+    child = orm.relationship(
+        "Priv", foreign_keys=[child_id], backref=orm.backref('inherited_by', viewonly=True), viewonly=True
+    )
+
+
+_t = PrivInherits.__table__
+
+
+class Priv(Base):
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    name = sa.Column(sa.Text, nullable=False, unique=True)
+    children = orm.relationship(
+        "Priv", secondary=_t, primaryjoin=(id == _t.c.parent_id), secondaryjoin=(_t.c.child_id == id),
+        collection_class=InstrumentedSet, backref=orm.backref('parents', collection_class=InstrumentedSet)
+    )
+    parent_names = association_proxy('parents', 'name')
+    child_names = association_proxy('children', 'name')
+del _t
+
+
+class AccountPriv(Base):
+    account_id = sa.Column(
+        sa.Integer, sa.ForeignKey('account.id', onupdate='cascade', ondelete='cascade'),
+        nullable=False, primary_key=True
+    )
+    priv_id = sa.Column(
+        sa.Integer, sa.ForeignKey('priv.id', onupdate='cascade', ondelete='cascade'),
+        nullable=False, primary_key=True
+    )
+
+
+class Account:
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    name = sa.Column(sa.Text, nullable=False, unique=True)
+    iam_platform = sa.Column(sa.Text, nullable=True)
+    privs = orm.relationship(
+        "Priv", secondary=AccountPriv.__table__, collection_class=InstrumentedSet,
+        backref=orm.backref('accounts', collection_class=InstrumentedSet)
+    )
+    priv_names = association_proxy('privs', 'name')
+
+
+class AccountIAm:
+    account_id = sa.Column(
+        'account_id', sa.Integer, sa.ForeignKey('account.id', onupdate='cascade', ondelete='cascade'), primary_key=True
+    )
+    platform = sa.Column('platform', sa.Text, nullable=False, primary_key=True),
+    name = sa.Column('name', sa.Text, nullable=False)
+    api_id = sa.Column('api_id', sa.Text, nullable=True)
 
 
 def get_status(db):
