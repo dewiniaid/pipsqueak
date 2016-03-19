@@ -1,22 +1,24 @@
 import datetime
 import concurrent.futures
+import sys
+import logging
+
 import ircbot
 from ircbot.commands.commands import Pattern, from_chain, bind, alias, doc
 import ircbot.modules.core
+from pydle import coroutine
+import tornado.platform.asyncio
+
 import ratlib
 import ratlib.db
 import ratlib.starsystem
-import logging
-from pydle import coroutine
-import asyncio
-import tornado.platform.asyncio
 
 logger = logging.getLogger(__name__)
 
 
 __all__ = [
     'bot', 'command', 'rule', 'RatbotConfig', 'setup', 'start', 'prepare',
-    'Pattern', 'from_chain', 'bind', 'alias', 'doc'
+    'Pattern', 'from_chain', 'bind', 'alias', 'doc', 'coroutine'
 ]
 bot = None
 rule = None
@@ -82,7 +84,7 @@ class Event(ircbot.Event):
         return self.reply(*args, **kwargs)
 
 
-def setup(filename):
+def setup(filename, db_upgrade=True, supports_restart=False, times_restarted=None,  **kwargs):
     global bot, command, rule
 
     # asyncio.get_event_loop()  # Ensure it's created
@@ -97,45 +99,6 @@ def setup(filename):
     command = bot.command
     rule = bot.rule
     bot.config.section('ratbot', RatbotConfig)
-
-    @command('version')
-    @alias('uptime')
-    @bind('', 'Shows bot current version and running time.')
-    def cmd_version(event):
-        from ratlib import format_timedelta, format_timestamp
-        started = bot.data['ratbot']['stats']['started']
-        event.say(
-            "Version {version}, up {delta} since {time}"
-            .format(
-                version=bot.data['ratbot']['version'],
-                delta=format_timedelta(datetime.datetime.now(tz=started.tzinfo) - started),
-                time=format_timestamp(started)
-            )
-        )
-
-    # Temporary
-    @command('whois')
-    @bind('<+nicknames:str>', 'Performs a WHOIS on the specified nicknames and returns a result.')
-    @coroutine
-    def cmd_whois(event, nicknames):
-        result = yield bot.whois(nicknames)
-        print(repr(result))
-        event.usay(repr(result).replace("\n", "  "))
-
-    @command('uprop')
-    @bind('<nickname:str> <property:str>')
-    @coroutine
-    def cmd_uprop(event, nickname, property):
-        result = yield bot.get_user_value(nickname, property)
-        print(repr(result))
-        event.usay(repr(result).replace("\n", "  "))
-
-    @command('udump')
-    @bind('')
-    def cmd_udump(event):
-        import pprint
-        pprint.pprint(event.bot.users)
-        pprint.pprint(event.bot.channels)
 
     # Attempt to determine some semblance of a version number.
     version = None
@@ -166,15 +129,29 @@ def setup(filename):
     else:
         bot.realname += " " + version
 
-    logger.info("Starting Ratbot version " + version)
+    if times_restarted:
+        logger.info(
+            "Reincarnating Ratbot (times: {times_restarted}), running version {version}."
+            .format(times_restarted=times_restarted, version=version)
+        )
+    else:
+        logger.info(
+            "Starting {restartable}Ratbot version {version}."
+            .format(version=version, restartable="restartable " if supports_restart else '')
+        )
 
     bot.data['ratbot'] = {
         'executor': concurrent.futures.ThreadPoolExecutor(max_workers=10),
         'version': version,
-        'stats': {'started': datetime.datetime.now(tz=datetime.timezone.utc)}
+        'stats': {'started': datetime.datetime.now(tz=datetime.timezone.utc)},
+        'restart_control': {
+            'enabled': supports_restart,
+            'count': times_restarted,
+            'exit_status': None
+        }
     }
 
-    ratlib.db.setup(bot)
+    ratlib.db.setup(bot, upgrade=db_upgrade)
     ratlib.starsystem.refresh_bloom(bot)
     result = ratlib.starsystem.refresh_database(
         bot,
@@ -191,5 +168,10 @@ def start():
         logger.info("Running " + fn.__module__ + "." + fn.__name__)
         fn(bot)
     pending = []
-    bot.connect()
-    bot.handle_forever()
+    try:
+        bot.connect()
+        bot.handle_forever()
+    except Exception as ex:
+        logger.exception("Encountered an unhandled exception during the main event loop.  Terminating.")
+        sys.exit(1)
+    sys.exit(bot.data['ratbot']['restart_control']['exit_status'] or 0)

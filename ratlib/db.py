@@ -4,10 +4,13 @@ Database support module.
 import functools
 import re
 import multiprocessing
-
+import logging
 import sqlalchemy as sa
 from sqlalchemy import sql, orm, schema
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
+
+logger = logging.getLogger(__name__)
+
 
 def run_alembic(filename, url):
     import alembic.command
@@ -17,24 +20,28 @@ def run_alembic(filename, url):
     alembic.command.upgrade(cfg, "head")
 
 
-def setup(bot):
+def setup(bot, upgrade=True):
     """
     Initial SQLAlchemy setup for this bot session.  Also performs in-place db upgrades.
 
     :param bot: IRC Bot instance, used for configuration
+    :param upgrade: If True (default), the database is upgrade on startup.
     """
     global engine, session_factory
     url = bot.config.ratbot.database
     if not url:
         raise ValueError("Database is not configured.")
 
-    # Schema migration/upgrade
-    process = multiprocessing.Process(target=run_alembic, args=(bot.config.ratbot.alembic, url))
-    process.start()
-    process.join()
-    if process.exitcode:
-        raise RuntimeError("Alembic subprocess terminated with unexpected error {}".format(process.exitcode))
-
+    # Schema migration/upgrade.  Must be done in a separate process because Alembic mucks with the loggers.
+    if upgrade:
+        logger.debug("Checking to see if the database needs to be upgraded.")
+        process = multiprocessing.Process(target=run_alembic, args=(bot.config.ratbot.alembic, url))
+        process.start()
+        process.join()
+        if process.exitcode:
+            raise RuntimeError("Alembic subprocess terminated with unexpected error {}".format(process.exitcode))
+    else:
+        logger.debug("Skipping database upgrade check.")
     engine = sa.create_engine(url)
     bot.data['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url)))
 
