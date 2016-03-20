@@ -274,6 +274,7 @@ def main():
     )
 
     import ratbot.core
+    import ratbot.auth
     import ratbot.autocorrect
     import ratbot.search
     import ratbot.facts

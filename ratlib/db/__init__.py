@@ -12,6 +12,17 @@ from .models import *
 logger = logging.getLogger(__name__)
 
 
+class Session(orm.Session):
+    """Add context handling to SQLAlchemy sessions."""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Always rollback afterwards.  Only commit if the caller explicitly requested it
+        self.rollback()
+        self.close()
+
+
 def run_alembic(filename, url):
     import alembic.command
     import alembic.config
@@ -43,15 +54,14 @@ def setup(bot, upgrade=True):
     else:
         logger.debug("Skipping database upgrade check.")
     engine = sa.create_engine(url)
-    bot.data['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url)))
+    bot.data['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url), class_=Session))
 
-    db = get_session(bot)
-    status = get_status(db)
-    if status is None:
-        status = Status(id=1, starsystem_refreshed=None)
-        db.add(status)
-        db.commit()
-    db.close()
+    with get_session(bot) as db:
+        status = get_status(db)
+        if status is None:
+            status = Status(id=1, starsystem_refreshed=None)
+            db.add(status)
+            db.commit()
 
 
 def get_session(bot):
@@ -76,11 +86,8 @@ def with_session(fn=None):
         def wrapper(*args, **kwargs):
             if 'db' in kwargs:
                 return fn(*args, **kwargs)
-            db = get_session(args[0])
-            try:
+            with get_session(args[0]) as db:
                 return fn(*args, db=db, **kwargs)
-            finally:
-                db.close()
         return wrapper
     return decorator(fn) if fn else decorator
 

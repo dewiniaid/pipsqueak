@@ -17,6 +17,7 @@ from ircbot.commands.exc import *
 
 from ratbot import *
 from ratlib.db import Fact, with_session
+from . import auth
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 class FactConfig(ircbot.ConfigSection):
     def read(self, section):
         self.filename = section.get('filename')
-        langs = re.findall(r'[^\S,]+', section.get("lang", "en").lower())
+        langs = re.findall(r'[^\s,]+', section.get("lang", "en").lower())
         if not langs:
             langs = ['en']
         self.langs = langs
@@ -180,7 +181,8 @@ def cmd_recite_fact(event, rats=None):
     "\n<fact-lang> means a fact name, followed by a hyphen, followed by a language code.  Example: \"name-en\""
 )
 @with_session
-def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False, full=False, db=None):
+@auth.requires_account
+def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False, full=False, db=None, account=None):
     """
     Lists known facts, list details on a fact, or rescans the fact database.
     """
@@ -206,6 +208,8 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
                 action = 'add'
 
         if action == 'add':
+            if not auth.check_priv(event, account, 'fact.add'):
+                return
             name = db.merge(Fact(name=name, lang=lang, message=text, author=event.nick))
             is_new = not inspect(name).persistent
             db.commit()
@@ -215,6 +219,8 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
             return
 
         if action == 'del':
+            if not auth.check_priv(event, account, 'fact.del'):
+                return
             fact = Fact.find(db, name=name, lang=lang)
             if fact:
                 formatted = format_fact(fact)
@@ -233,20 +239,20 @@ def cmd_fact(event, action='show', key=None, factid=None, text=None, force=False
 
     # Still here.  Must be one of the other commands
     if action == 'import':
-        # if access & (HALFOP | OP):
+        if not auth.check_priv(event, account, 'fact.import'):
+            return
         import_facts(event.bot, merge=bool(force))
         logger.info("{event.nick} is importing facts.".format(event))
         event.qsay("Facts imported.")
         return
-        # return bot.reply("Not authorized.")
 
     if action != 'show':
         raise RuntimeError('Reached code that should be unreachable.')
 
     if not key:
         if full:
-            # if not (access & (HALFOP | OP)):
-            #     return bot.reply("Not authorized.")
+            if not auth.check_priv(event, account, 'fact.full'):
+                return
             if event.channel and not event.quiet:
                 event.reply("Messaging you the complete fact database.")
             event.usay("Language search order is {}".format(", ".join(event.bot.config.ratfacts.langs)))

@@ -21,6 +21,7 @@ from ratlib.starsystem import refresh_database, scan_for_systems, ConcurrentOper
 from ratlib.autocorrect import correct
 from ratbot import *
 from ircbot.commands.exc import UsageError
+from . import auth
 
 command = functools.partial(command, category='STARSYSTEMS')
 
@@ -187,16 +188,19 @@ def task_sysrefresh(bot):
 @command('sysrefresh')
 @bind('[?force=-f]', "Refreshes the starsystem list if it is stale.  (-f: Even if it is not stale.)")
 @with_session
-def cmd_sysrefresh(event, force=False, db=None):
+@auth.requires_account
+def cmd_sysrefresh(event, force=False, db=None, account=None):
     """
-    Refreshes the starsystem database if you have halfop or better.  Reports the last refresh time otherwise.
+    Refreshes the starsystem database if you have privileges.  Reports the last refresh time otherwise.
 
     -f: Force refresh even if data is stale.  Requires op.
     """
     # TODO: Reimplement access checking
-    privileged = True
-    # access = ratlib.sopel.best_channel_mode(bot, trigger.nick)
-    # privileged = access & (HALFOP | OP)
+    if force:
+        if not auth.check_priv(event, account, 'sysrefresh.force'):
+            return
+
+    privileged = account and account.can('sysrefresh')
     msg = ""
 
     def callback():

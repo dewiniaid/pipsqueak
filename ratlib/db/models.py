@@ -189,9 +189,11 @@ class AccountPriv(ModelBase):
         sa.Integer, sa.ForeignKey('priv.id', onupdate='cascade', ondelete='cascade'),
         nullable=False, primary_key=True
     )
+    account = orm.relationship(lambda: Account, viewonly=True, backref=orm.backref("privlinks", viewonly=True))
+    priv = orm.relationship(lambda: Priv, viewonly=True, backref=orm.backref("accountlinks", viewonly=True))
 
 
-class Account:
+class Account(ModelBase):
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
     name = sa.Column(sa.Text, nullable=False, unique=True)
     iam_platform = sa.Column(sa.Text, nullable=True)
@@ -202,11 +204,12 @@ class Account:
     priv_names = association_proxy('privs', 'name')
 
 
-class AccountIAm:
+
+class AccountIAm(ModelBase):
     account_id = sa.Column(
         'account_id', sa.Integer, sa.ForeignKey('account.id', onupdate='cascade', ondelete='cascade'), primary_key=True
     )
-    platform = sa.Column('platform', sa.Text, nullable=False, primary_key=True),
+    platform = sa.Column('platform', sa.Text, nullable=False, primary_key=True)
     name = sa.Column('name', sa.Text, nullable=False)
     api_id = sa.Column('api_id', sa.Text, nullable=True)
 

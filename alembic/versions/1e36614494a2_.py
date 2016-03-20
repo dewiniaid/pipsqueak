@@ -42,8 +42,8 @@ def upgrade():
         'fact': {'fact.edit', 'fact.import', 'fact.full'},
         'fact.edit': {'fact.add', 'fact.del'},
         'sysrefresh.force': {'sysrefresh'},
-        'auth': {'auth.grant', 'auth.revoke'},
-        'privs': {'privs.add', 'privs.del'}
+        'auth': {'auth.grant', 'auth.revoke', 'auth.groups'},
+        '*': None
     }
     all_privs = set()
     for k, v in privs.items():

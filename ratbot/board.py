@@ -19,6 +19,7 @@ import operator
 import re
 import functools
 import json
+import pprint
 
 import aiohttp
 from aiohttp.websocket import CLOSE_UNSUPPORTED_DATA, CLOSE_OK, CLOSE_POLICY_VIOLATION
@@ -93,6 +94,8 @@ class RatboardConfig(ircbot.ConfigSection):
         self.case_pool_size = section.getint('case_pool_size', 10)
         self.case_history = section.getint('case_history', 10)
         self.client_history = section.getint('client_history', 5000)
+        self.apidebug = section.getboolean('apidebug', True)
+
 bot.config.section('ratboard', RatboardConfig)
 
 
@@ -106,7 +109,7 @@ def setup(bot):
     }
 
     if bot.config.ratbot.wsurl:
-        ws = bot.data['ratboard']['ws'] = WSAPI(bot.config.ratbot.wsurl)
+        ws = bot.data['ratboard']['ws'] = WSAPI(bot.config.ratbot.wsurl, debug=bot.config.ratboard.apidebug)
         asyncio.get_event_loop().call_soon(ws.start)
     asyncio.get_event_loop().run_until_complete(refresh_cases(bot))
 
@@ -116,7 +119,7 @@ class WSAPI:
     reference_attr = 'return'  #: Attribute of metadata that will contain our request ID.
     _default = object()
 
-    def __init__(self, url, *, loop=None, default_timeout=30.0):
+    def __init__(self, url, *, loop=None, default_timeout=30.0, debug=False):
         """
         :param url: URL we connect to.
         :param loop: AIO event loop.  `None` means it will be autodetected.  Used as the default loop for .start()
@@ -128,6 +131,7 @@ class WSAPI:
         self.task = None  #: Handle to the task created by :meth:`start`
         self.logger = logger.getChild('WSAPI')  #: Logger.
         self.loop = loop  #: Event loop
+        self.debug = debug
 
         self.default_timeout = default_timeout  #: How long we wait for a response to any one given request (by default)
 
@@ -162,6 +166,23 @@ class WSAPI:
         self.connection = None
         return result
 
+    def log_request(self, obj, prefix='', **kwargs):
+        """
+        Pretty formats obj, for debugging.
+
+        :param obj: Object to pretty-print
+        :param prefix: Prefix that will be added to each line.
+        :param kwargs: Arguments to pass to pprint.pformat()
+        :return: Formatted str
+        """
+        if not self.debug:
+            return
+        kwargs.setdefault('indent', 1)
+        kwargs.setdefault('compact', False)
+        result = pprint.pformat(obj, **kwargs)
+        for line in result.split("\n"):
+            self.logger.debug(prefix + line)
+
     async def dispatcher(self):
         """Handles dispatching requests."""
         self.logger.info("Connecting...")
@@ -195,20 +216,29 @@ class WSAPI:
                         if not isinstance(data, dict):
                             await self._terminate("JSON message was not a dict.", CLOSE_POLICY_VIOLATION)
                             break
+                        if 'error' in data:
+                            self.logger.error("API Error: " + repr(data['error']))
                         if 'meta' not in data:
                             await self._terminate("Message from API lacked metadata.", CLOSE_POLICY_VIOLATION)
                             break
                         result_id = data['meta'].get(self.reference_attr)
                         # Dispatch result.
                         if result_id is None:
-                            # TODO: Handle 'default' results (subscriptions!)
+                            self.logger.debug("[*] Received Message.")
+                            tag = '*'
+                        else:
+                            tag = result_id
+                            self.logger.debug("[{}] Received Response.".format(tag))
+                        self.log_request(data, prefix="[{}] << ".format(tag))
+                        if result_id is None:
                             continue
                         try:
                             result = self.result_futures.get(result_id)
                         except TypeError as ex:  # Unhashable type, probably.
-                            self.logger.warn("Received a result with an unhashable result_id")
+                            self.logger.warn("Received a result with unhashable result_id: '{}'".format(result_id))
+                        if result is None:
+                            self.logger.warn("Received a result_id that we weren't expecting: '{}'".format(result_id))
                             continue
-                        self.logger.debug("[{}] Received Response.".format(result_id))
                         result.set_result(data)
             except Exception:
                 self.logger.exception("Error in WS event loop, terminating connection.")
@@ -229,6 +259,7 @@ class WSAPI:
         :param data: Message to send.  Must be a dict.
         """
         await self.connected_future
+        self.log_request(data, prefix="[*] >> ")
         self.connection.send_str(json.dumps(data))
 
     def _remove_result(self, result_id, *unused):
@@ -259,9 +290,10 @@ class WSAPI:
 
         try:
             with handler:
+                await self.connected_future
                 self.logger.debug("[{}] Submitted Request.".format(result_id))
                 self.result_futures[result_id] = future = asyncio.Future()
-                await self.connected_future
+                self.log_request(data, prefix="[{}] >> ".format(result_id))
                 self.connection.send_str(json.dumps(data))
                 return await future
         except asyncio.TimeoutError:
@@ -719,9 +751,10 @@ class Rescue(TrackedBase):
         if not props:
             return  # Nothing to do
 
-        request = {}
+        request = {'data': self._dump(props)}
         if self.id:
             request['id'] = self.id
+            request['data']['id'] = self.id
             request['action'] = 'rescues:update'
         else:
             request['action'] = 'rescues:create'
@@ -1072,7 +1105,6 @@ def cmd_list(event, shortoptions=None, options=None):
             cr=cr
         )
 
-
     lists = []
     if show_closed:
         lists.append(('recently closed', True, sorted(board.rescues, key=board.rescue_sort_key)))
@@ -1083,7 +1115,7 @@ def cmd_list(event, shortoptions=None, options=None):
         inactives = list(filter(lambda x: not x.active, board.rescues))
         if show_inactive:
             inactives.sort(key=_keyfn)
-        lists.append(('inactive', show_inactive, sorted(filter(lambda x: x.active, board.rescues), key=_keyfn)))
+        lists.append(('inactive', show_inactive, sorted(filter(lambda x: not x.active, board.rescues), key=_keyfn)))
 
     output = []
     for name, expand, cases in lists:
@@ -1327,7 +1359,7 @@ async def cmd_codered(event, rescue):
     await save_or_complain(event, rescue)
 
 
-def cmd_platform(event, rescue, platform):
+async def cmd_platform(event, rescue, platform):
     """
     Sets a case platform to PC or xbox.
     """
@@ -1335,6 +1367,7 @@ def cmd_platform(event, rescue, platform):
     event.qsay(
         "{rescue.client_name}'s platform set to {platform}".format(rescue=rescue, platform=rescue.platform.upper())
     )
+    await save_or_complain(event, rescue)
     # FIXME
     # save_case_later(
     #     event.bot, rescue,

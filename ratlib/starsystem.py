@@ -474,9 +474,8 @@ def scan_for_systems(bot, line, min_ratio=0.05, min_length=6):
         return set()
 
     # Still here, so find prefixes in the database
-    db = get_session()
     results = {}
-    try:
+    with get_session(bot) as db:
         # Find matching prefixes
         for prefix in db.query(StarsystemPrefix).filter(
                 StarsystemPrefix.first_word.in_(candidates.keys()),
@@ -497,5 +496,3 @@ def scan_for_systems(bot, line, min_ratio=0.05, min_length=6):
                     continue
                 results[prefix.first_word] = system.name
         return set(results.values())
-    finally:
-        db.rollback()
