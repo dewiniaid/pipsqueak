@@ -26,7 +26,7 @@ def cmd_version(event):
 @command('shutdown', category='ADMIN')
 @bind('[?confirm=confirm]', 'Tells the bot to shutdown.')
 @auth.requires_account('shutdown.shutdown')
-def cmd_shutdown(event, confirm=None):
+def cmd_shutdown(event, confirm=None, account=None):
     logger.info("<{event.nick}> {event.message}".format(event=event))
     if not confirm:
         event.reply("Use '{} confirm' if you are sure you wish to trigger shutdown.".format(event.full_name))
@@ -42,7 +42,7 @@ def cmd_shutdown(event, confirm=None):
 @command('restart', category='ADMIN')
 @bind('[?confirm=confirm]', 'Tells the bot to restart.')
 @auth.requires_account('shutdown.restart')
-def cmd_shutdown(event, confirm=None):
+def cmd_shutdown(event, confirm=None, account=None):
     logger.info("<{event.nick}> {event.message}".format(event=event))
     if not confirm:
         event.reply("Use '{} confirm' if you are sure you wish to trigger a restart.".format(event.full_name))
@@ -88,7 +88,7 @@ def cmd_shutdown(event, confirm=None):
 @command('join', category='ADMIN')
 @bind('<channel> [<?password>]', 'Joins the specified channel, optionally using the specified password.')
 @auth.requires_account('channel.join')
-def cmd_join(event, channel, password=None):
+def cmd_join(event, channel, password=None, account=None):
     if not event.bot.is_channel(channel):
         event.qreply("'{}' doesn't look like a channel.".format(channel))
         return
@@ -101,7 +101,7 @@ def cmd_join(event, channel, password=None):
 @command('part', category='ADMIN')
 @bind('[<?channel>]', 'Parts (leaves) the specified channel. If no channel is specified, leaves the current channel.')
 @auth.requires_account('channel.part')
-def cmd_part(event, channel=None):
+def cmd_part(event, channel=None, account=None):
     if channel is None and event.channel is None:
         event.qreply("A channel must be specified.")
         return
