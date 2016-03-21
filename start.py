@@ -69,8 +69,7 @@ def watchdog():
             print("Child process exited normally.  Not restarting.", file=sys.stderr)
             return 0  # Normal exit.
         if result.returncode == 100:  # Our special 'intentional requesting restart' code.
-            print("Child process requested a restart.  Restarting in 5 seconds...", file=sys.stderr)
-            time.sleep(5)
+            print("Child process requested a restart.", file=sys.stderr)
             continue
         now = time.time()
         if now - last_fail > fail_timeout:
