@@ -188,7 +188,30 @@ class Account:
                 self.add_nick(nick)
 
         self.data = {}  # Misc data
-        self.iam = {}  # Temporary IAm data
+
+    def get_instance(self, db):
+        """
+        Returns the database account instance, or None if it doesn't exist.
+        """
+        if self.name is None:
+            return None
+        return db.query(models.Account).filter(models.Account.name == self.name.lower()).first()
+
+    def ensure_instance(self, db):
+        """
+        Returns the database account instance or creates it if it doesn't exist.
+
+        The created instance will be added to the caller's session, and thus the caller must commit for it to be
+        saved.
+        """
+        if self.name is None:
+            raise ValueError("Cannot create an account instance for an anonymous account.")
+        result = db.query(models.Account).filter(models.Account.name == self.name.lower()).first()
+        if result:
+            return result
+        result = models.Account(name=self.name)
+        db.add(result)
+        return result
 
     def privileges(self):
         """Returns a set of the user's privileges."""

@@ -204,7 +204,6 @@ class Account(ModelBase):
     priv_names = association_proxy('privs', 'name')
 
 
-
 class AccountIAm(ModelBase):
     account_id = sa.Column(
         'account_id', sa.Integer, sa.ForeignKey('account.id', onupdate='cascade', ondelete='cascade'), primary_key=True
@@ -212,5 +211,7 @@ class AccountIAm(ModelBase):
     platform = sa.Column('platform', sa.Text, nullable=False, primary_key=True)
     name = sa.Column('name', sa.Text, nullable=False)
     api_id = sa.Column('api_id', sa.Text, nullable=True)
-
-
+    account = orm.relationship(
+        "Account",
+        backref=orm.backref("iam", collection_class=orm.collections.attribute_mapped_collection('platform'))
+    )

@@ -20,7 +20,7 @@ import re
 import functools
 import json
 import pprint
-
+from sqlalchemy import orm
 import aiohttp
 from aiohttp.websocket import CLOSE_UNSUPPORTED_DATA, CLOSE_OK, CLOSE_POLICY_VIOLATION
 
@@ -30,20 +30,37 @@ from ircbot.commands.exc import *
 
 from ratbot import *
 from ratbot.facts import find_fact
-from ratlib.db import with_session
+from ratlib.db import with_session, models
 from ratlib import friendly_timedelta, format_timestamp
 from ratlib.autocorrect import correct
 from ratlib.starsystem import scan_for_systems
 from ratlib.api.props import *
-import ratlib.db
+from . import auth
 
 import asyncio
+import collections
 
 bold = lambda x: x  # PLACEHOLDER  FIXME
 
 logger = logging.getLogger(__name__)
 
 command = functools.partial(command, category='RESCUES')
+
+Platform = collections.namedtuple('Platform', ['name', 'regex', 'pattern', 'detect'])
+PLATFORMS = {}
+for platform, name, regex in (
+    ('pc', 'PC', 'pc'),
+    ('xb', 'XBox', 'xb(?:ox)?(?:-?(?:1|one))?')
+):
+    PLATFORMS[platform] = Platform(name, regex, re.compile(regex, flags=re.IGNORECASE), re.compile(
+        """
+        (?:[^\w-]|\A)  # Beginning of line, or non-hyphen word boundary
+        {}             # ... followed by case's detection pattern (inserted by format)
+        (?:[^\w-]|\Z)  # End of line, or non-hyphen word boundary
+        """.format(regex), flags=re.IGNORECASE | re.VERBOSE
+
+    ))
+del platform, name, regex
 
 
 @ircbot.commands.register_type('rescue')
@@ -82,7 +99,7 @@ class RescueParamType(ircbot.commands.ParamType):
         if result.rescue is None:
             if self.create:
                 raise UsageError("Case {} was not found and could not be created.".format(value), final=True)
-            elif self.must_exist:
+            else:
                 raise UsageError("Case {} was not found.".format(value), final=True)
         return result if self.fullresult else result.rescue
 
@@ -559,6 +576,7 @@ class ClosedRescueBoard(RescueBoardBase):
         offset = self.maxval - self.lastval
         return (rescue.boardindex + offset) % self.maxval
 
+
 class Rescue(TrackedBase):
     active = TrackedProperty(default=True)
     createdAt = DateTimeProperty(readonly=True)
@@ -949,24 +967,10 @@ def append_quotes(bot, search, lines, autocorrect=True, create=True, detect_plat
     if detect_platform and rv.rescue.platform == 'unknown':
         platforms = set()
         for line in rv.added_lines:
-            if re.search(
-                r"""
-                (?:[^\w-]|\A)  # Beginning of line, or non-hyphen word boundary
-                pc             # ... followed by "PC"
-                (?:[^\w-]|\Z)  # End of line, or non-hyphen word boundary
-                """, line, flags=re.IGNORECASE | re.VERBOSE
-            ):
-                platforms.add('pc')
-
-            if re.search(
-                r"""
-                (?:[^\w-]|\A)  # Beginning of line, or non-hyphen word boundary
-                xb(?:ox)?      # ... followed by "XB" or "XBOX"
-                (?:-?(?:1|one))?  # ... maybe followed by 1/one, possibly w/ leading hyphen
-                (?:[^\w-]|\Z)  # End of line, or non-hyphen word boundary
-                """, line, flags=re.IGNORECASE | re.VERBOSE
-            ):
-                platforms.add('xb')
+            # Attempt to detect a platform
+            for platform_id, platform in PLATFORMS.items():
+                if platform.detect.search(line):
+                    platforms.add(platform_id)
         if len(platforms) == 1:
             rv.rescue.platform = platforms.pop()
             rv.detected_platform = rv.rescue.platform
@@ -1376,18 +1380,13 @@ async def cmd_platform(event, rescue, platform):
     #         .format(rescue=rescue)
     #     )
     # )
-from_chain(
-    functools.partial(cmd_platform, platform='pc'),
-    command(name='pc'),
-    bind('<rescue:rescue:exists>', "Sets a case's platform to XBox")
-)
-from_chain(
-    functools.partial(cmd_platform, platform='xb'),
-    command(name='xbox', aliases=[Pattern('xb(?:ox)?(?:-?(?:1|one))?')]),
-    bind('<rescue:rescue:exists>', "Sets a case's platform to XBox"),
-    doc("(Note that various alternate forms are accepted; e.g. xb1, xbox-1, xbone...)")
-)
-
+for platform_id, platform in PLATFORMS.items():
+    from_chain(
+        functools.partial(cmd_platform, platform=platform_id),
+        command(name=platform.name.lower(), aliases=[Pattern(platform.regex)]),
+        bind('<rescue:rescue:exists>', "Sets a case's platform to " + platform.name)
+    )
+del platform_id, platform
 
 @command('system', aliases=['sys', 'loc', 'location'])
 @bind('<rescue:rescue:exists> <system:line>', "Sets a rescue's location.")
@@ -1395,7 +1394,7 @@ from_chain(
 async def cmd_system(event, rescue, system, db=None):
     # Try to find the system in EDSM.
     fmt = "Location of {rescue.client_name} set to {rescue.system}"
-    result = db.query(ratlib.db.Starsystem).filter(ratlib.db.Starsystem.name_lower == system.lower()).first()
+    result = db.query(models.Starsystem).filter(models.Starsystem.name_lower == system.lower()).first()
     if result:
         system = result.name
     else:
@@ -1454,3 +1453,172 @@ async def cmd_commander(event, rescue, commander):
         .format(rescue=rescue, commander=commander)
     )
     await save_or_complain(event, rescue)
+
+
+def platform_name(platform_id):
+    if not platform_id:
+        return 'unknown'
+    if platform_id in PLATFORMS:
+        return PLATFORMS[platform_id].name
+    return platform_id
+
+
+@command('iam')
+@bind('', "Shows the CMDR name(s) the bot thinks you are currently operating as.")
+@bind('<platform:str> <cmdr:line>', "Sets your CMDR name on the specified platform.")
+@auth.requires_account
+@with_session
+async def cmd_iam(event, platform=None, cmdr=None, account=None, db=None):
+    ws = bot.data['ratboard']['ws']
+    if platform is None:
+        sync_iam(account, db)
+        identities = []
+        for platform_id in sorted(account.data['iam']):
+            iam = account.data['iam'][platform_id]
+            identities.append("CMDR {} (on {})".format(iam.name, platform_name(platform_id)))
+        if not identities:
+            event.qreply("Your CMDR name is not set on any platforms.")
+            return
+        event.qreply("You are {temporarily}known as {identities}.  Your default platform is {platform}.".format(
+            temporarily='' if account.name else 'temporarily ',
+            identities=", ".join(identities),
+            platform=account.data['iam_platform'] or 'unknown'
+        ))
+        return
+    platform = platform.lower()
+    for platform_id, data in PLATFORMS.items():
+        if data.pattern.fullmatch(platform):
+            break
+    else:
+        raise UsageError("Unknown platform '{}'".format(platform))
+
+    if account.name is None:
+        event.unotice("You are not currently identified with NickServ.  Changes to preferences will not be saved.")
+
+    api_id = None
+    warning = None
+
+    if ws:
+        # Try to validate their selection
+        request = {
+            'action': "rats:read",
+            'data': {
+                'platform': platform_id,
+                'CMDRname': cmdr
+            },
+            'meta': { 'limit': 5 }
+        }
+        result = await ws.request(request)
+        # Deal with API madness.
+        matchlevel = 0  # 4 = exact match, 3 = platform mismatch, 2 = closest same platform, 1 = closest platforms
+        best_match = None
+        for rat in result['data']:
+            if rat['CMDRname'].lower() == cmdr.lower():
+                if rat['platform'] == platform_id:
+                    api_id = rat['_id']
+                    best_match = rat
+                    matchlevel = 4
+                    break
+                best_match = rat
+                matchlevel = 3
+                continue
+            if matchlevel < 2 and rat['platform'] == platform_id:
+                best_match = rat
+                matchlevel = 2
+                continue
+            if not matchlevel:
+                matchlevel = 1
+                best_match = rat
+        if matchlevel == 3:
+            warning = (
+                "A rat with that name was found, but on platform '{}'."
+                "  Rescues may not be linked to you.".format(platform_name(best_match['platform']))
+            )
+        elif matchlevel == 2:
+            warning = (
+                "No rat with that name was found.  The closest match on that platform is '{}'."
+                "  Rescues may not be linked to you.".format(best_match['CMDRname'])
+            )
+        elif matchlevel == 1:
+            warning = (
+                "No rat with that name was found.  The closest match on platform '{}' is '{}'."
+                "  Rescues may not be linked to you.".format(
+                    platform_name(best_match['platform']), best_match['CMDRname']
+                )
+            )
+        elif not matchlevel:
+            warning = "No rat with that name was found.  Rescues may not be linked to you."
+    if account.name:
+        instance = account.ensure_instance(db)
+        db.add(instance)
+        sync_iam(account, db, platform_id, instance)
+        iam = models.AccountIAm(account_id=instance.id, platform=platform_id, api_id=api_id, name=cmdr)
+        iam = db.merge(iam)
+        db.commit()
+        orm.make_transient(iam)
+    else:
+        sync_iam(account, db, platform_id)
+        iam = models.AccountIAm(platform=platform_id, api_id=api_id, name=cmdr)
+    orm.make_transient(iam)
+    account.data.setdefault('iam_platform', platform_id)
+    account.data.setdefault('iam', {})
+    account.data['iam'][platform_id] = iam
+
+    message = "You are now CMDR {} on {}.".format(cmdr, platform_name(best_match['platform']))
+    if warning:
+        message += "  " + warning
+    event.qreply(message)
+
+@command('imon', aliases=['iamon'])
+@bind('', "Shows the platform the bot thinks you are currently playing on.")
+@bind('<platform:str>', "Sets your current platform.")
+@auth.requires_account
+@with_session
+async def cmd_imon(event, platform=None, account=None, db=None):
+    sync_iam(account, db)
+    if not account.data['iam']:
+        event.qreply("You have no identities configured.  Configure one with {}iam first.".format(event.prefix))
+        return
+    if platform is None:
+        event.qreply("Your current plaform is {}.".format(platform_name(account.data['iam_platform'])))
+        return
+    platform = platform.lower()
+    for platform_id, data in PLATFORMS.items():
+        if data.pattern.fullmatch(platform):
+            break
+    else:
+        raise UsageError("Unknown platform '{}'".format(platform))
+    if platform_id not in account.data['iam']:
+        event.qreply(
+            "You do not have an identity configured on that platform.  Configure one with {}iam first."
+            .format(event.prefix)
+        )
+        return
+    account.data['iam_platform'] = platform
+    if account.name is None:
+        event.unotice("You are not currently identified with NickServ.  Changes to preferences will not be saved.")
+    if account.name:
+        instance = account.ensure_instance(db)
+        instance.iam_platform = platform
+        db.add(instance)
+        db.commit()
+    event.qreply("Your current platform is now {}.".format(platform_name(platform)))
+
+
+def sync_iam(account, db, platform_id=None, instance=None):
+    """Retrieves IAM data from the database."""
+    account.data.setdefault('iam', {})
+    if not instance:
+        instance = account.get_instance(db)
+    if not account.data.get('iam_platform'):
+        if instance and instance.iam_platform:
+            account.data['iam_platform'] = instance.iam_platform
+        else:
+            account.data['iam_platform'] = platform_id
+            if instance:
+                instance.iam_platform = platform_id
+    if instance:
+        for platform_id, iam in instance.iam.items():
+            orm.make_transient(iam)
+            account.data['iam'][platform_id] = iam
+
