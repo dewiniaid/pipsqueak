@@ -53,7 +53,7 @@ def setup(bot, upgrade=True):
             raise RuntimeError("Alembic subprocess terminated with unexpected error {}".format(process.exitcode))
     else:
         logger.debug("Skipping database upgrade check.")
-    engine = sa.create_engine(url)
+    engine = sa.create_engine(url, echo=bot.config.ratbot.debug_sql)
     bot.data['db'] = orm.scoped_session(orm.sessionmaker(sa.create_engine(url), class_=Session))
 
     with get_session(bot) as db:

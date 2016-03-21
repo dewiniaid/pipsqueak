@@ -87,18 +87,16 @@ class Event(ircbot.Event):
 def setup(filename, db_upgrade=True, supports_restart=False, times_restarted=None,  **kwargs):
     global bot, command, rule
 
-    # asyncio.get_event_loop()  # Ensure it's created
     loop = tornado.platform.asyncio.AsyncIOMainLoop()
     loop.install()
-    # asyncio.set_event_loop(loop.asyncio_loop)
 
     bot = ircbot.Bot(filename=filename, event_factory=Event)
+    bot.config.section('ratbot', RatbotConfig)
     ircbot.modules.core.help_command.allow_full = False
     ircbot.modules.core.help_command.category = 'Core'
     bot.command_registry.register(ircbot.modules.core.help_command)
     command = bot.command
     rule = bot.rule
-    bot.config.section('ratbot', RatbotConfig)
 
     # Attempt to determine some semblance of a version number.
     version = None
